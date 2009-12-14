@@ -355,7 +355,11 @@ class Session(object):
             raise koji.AuthError, 'could not verify client: %s' % env.get('SSL_CLIENT_VERIFY')
 
         name_dn_component = context.opts.get('DNUsernameComponent', 'CN')
-        client_name = env.get('SSL_CLIENT_S_DN_%s' % name_dn_component)
+        if name_dn_component != 'DN':
+          client_name = env.get('SSL_CLIENT_S_DN_%s' % name_dn_component)
+        else:
+          client_name = env.get('SSL_CLIENT_S_DN')
+
         if not client_name:
             raise koji.AuthError, 'unable to get user information (%s) from client certificate' % name_dn_component
 
