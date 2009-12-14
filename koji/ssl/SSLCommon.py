@@ -28,6 +28,17 @@ def our_verify(connection, x509, errNum, errDepth, preverifyOK):
     # correctly authenticates against the CA chain
     return preverifyOK
 
+def getPassphraseCB(size, repeat=False, *data):
+    try:
+        data[0]['passphrase']
+    except KeyError:
+        data[0]['passphrase'] = None
+
+    if data[0]['passphrase'] is None:
+        import getpass
+        data[0]['passphrase'] = getpass.getpass("Enter certificate (%s) passphrase:" % data[0]['key_and_cert'])
+
+    return data[0]['passphrase']
 
 def CreateSSLContext(certs):
     key_and_cert = certs['key_and_cert']
@@ -38,6 +49,8 @@ def CreateSSLContext(certs):
             raise StandardError, "%s does not exist or is not readable" % f
 
     ctx = SSL.Context(SSL.SSLv3_METHOD)   # SSLv3 only
+    ctx.set_passwd_cb(getPassphraseCB, certs)
+
     ctx.use_certificate_file(key_and_cert)
     ctx.use_privatekey_file(key_and_cert)
     ctx.load_client_ca(ca_cert)
