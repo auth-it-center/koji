@@ -175,8 +175,16 @@ def login(req, page=None):
         if env.get('SSL_CLIENT_VERIFY') != 'SUCCESS':
             raise koji.AuthError, 'could not verify client: %s' % env.get('SSL_CLIENT_VERIFY')
 
-        # use the subject's common name as their username
-        username = env.get('SSL_CLIENT_S_DN_CN')
+        username_env = options.get('EnvVarForUserName')
+        
+        if username_env:
+          # If EnvVarForUserName is defined use this for username
+          username = env.get(username_env)
+          
+        else:
+          # by default use the subject's common name as their username (for bac
+          username = env.get('SSL_CLIENT_S_DN_CN')
+          
         if not username:
             raise koji.AuthError, 'unable to get user information from client certificate'
         
