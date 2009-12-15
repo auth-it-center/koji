@@ -71,6 +71,9 @@ def parse_args(args):
         parser.print_usage()
         sys.exit(1)
 
+    if 'x86_64' in opts.arches:
+        opts.arches.append('i386')
+
     # expand arches
     for arch in opts.arches[:]:
         if EXPAND_ARCHES.has_key(arch):
