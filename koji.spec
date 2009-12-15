@@ -1,6 +1,6 @@
 %{!?python_sitelib: %define python_sitelib %(%{__python} -c "from distutils.sysconfig import get_python_lib; print get_python_lib()")}
 
-%define baserelease 1%{?distribution}
+%define baserelease 2%{?distribution}
 #build with --define 'testbuild 1' to have a timestamp appended to release
 %if "x%{?testbuild}" == "x1"
 %define release %{baserelease}.%(date +%%Y%%m%%d.%%H%%M.%%S)
@@ -191,6 +191,15 @@ if [ $1 = 0 ]; then
 fi
 
 %changelog
+* Tue Dec 15 2009 Christos Triantafyllidis <ctria@grid.auth.gr> - 1.3.2-2%{?distribution}
+- Restored an old 'ugly' hack that is needed for old yum versions.
+- Added 32bit packages to the 64bit repositories.
+
+* Mon Dec 14 2009 Christos Triantafyllidis <ctria@grid.auth.gr> - 1.3.2-1%{?distribution}
+- Added the distribution name at the version release
+- Added a callback to cache the privatekey's passphrase
+- Treated DNUsernameComponent=DN as a special case (use of SSL_CLIENT_S_DN variable)
+
 * Tue Nov 10 2009 Mike Bonnet <mikeb@redhat.com> - 1.3.2-1
 - support for LiveCD creation
 - new event-based callback system
