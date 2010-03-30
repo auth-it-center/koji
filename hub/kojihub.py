@@ -925,7 +925,7 @@ def readPackageList(tagID=None, userID=None, pkgID=None, event=None, inherit=Fal
     packages = {}
     fields = (('package.id', 'package_id'), ('package.name', 'package_name'),
               ('tag.id', 'tag_id'), ('tag.name', 'tag_name'),
-              ('users.id', 'owner_id'), ('users.name', 'owner_name'),
+              ('users.id', 'owner_id'), ('users.name', 'owner_name'), ('users.email', 'owner_email'),
               ('extra_arches','extra_arches'),
               ('tag_packages.blocked', 'blocked'))
     flist = ', '.join([pair[0] for pair in fields])
@@ -2794,7 +2794,7 @@ def get_build(buildInfo, strict=False):
               ("package.name || '-' || build.version || '-' || build.release", 'nvr'),
               ('EXTRACT(EPOCH FROM events.time)','creation_ts'),
               ('EXTRACT(EPOCH FROM build.completion_time)','completion_ts'),
-              ('users.id', 'owner_id'), ('users.name', 'owner_name'))
+              ('users.id', 'owner_id'), ('users.name', 'owner_name'), ('users.email', 'owner_email'))
     query = """SELECT %s
     FROM build
     JOIN events ON build.create_event = events.id
@@ -4046,12 +4046,12 @@ def get_notification_recipients(build, tag_id, state):
 
     if notify_on_success is True or state != koji.BUILD_STATES['COMPLETE']:
         # user who submitted the build
-        emails.append('%s@%s' % (build['owner_name'], email_domain))
+				emails.append(build['owner_email'])
 
         if tag_id:
             packages = readPackageList(pkgID=package_id, tagID=tag_id, inherit=True)
             # owner of the package in this tag, following inheritance
-            emails.append('%s@%s' % (packages[package_id]['owner_name'], email_domain))
+						emails.append(packages[package_id]['owner_email'])
         #FIXME - if tag_id is None, we don't have a good way to get the package owner.
         #   using all package owners from all tags would be way overkill.
 
