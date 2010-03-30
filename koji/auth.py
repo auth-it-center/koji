@@ -563,7 +563,7 @@ class Session(object):
         else:
             return None
 
-    def createUser(self, name, usertype=None, status=None, krb_principal=None):
+    def createUser(self, name, usertype=None, status=None, krb_principal=None, email=None):
         """
         Create a new user, using the provided values.
         Return the user_id of the newly-created user.
@@ -586,8 +586,8 @@ class Session(object):
         cursor.execute(select, locals())
         user_id = cursor.fetchone()[0]
 
-        insert = """INSERT INTO users (id, name, usertype, status, krb_principal)
-        VALUES (%(user_id)i, %(name)s, %(usertype)i, %(status)i, %(krb_principal)s)"""
+        insert = """INSERT INTO users (id, name, usertype, status, krb_principal, email)
+        VALUES (%(user_id)i, %(name)s, %(usertype)i, %(status)i, %(krb_principal)s, %(email)s)"""
         cursor.execute(insert, locals())
         context.cnx.commit()
 

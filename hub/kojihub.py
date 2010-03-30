@@ -6118,7 +6118,7 @@ class RootExports(object):
         WHERE user_id = %(user_id)i and perm_id = %(perm_id)i"""
         _dml(update, locals())
 
-    def createUser(self, username, status=None, krb_principal=None):
+    def createUser(self, username, status=None, krb_principal=None, email=None):
         """Add a user to the database"""
         context.session.assertPerm('admin')
         if get_user(username):
@@ -6126,7 +6126,7 @@ class RootExports(object):
         if krb_principal and get_user(krb_principal):
             raise koji.GenericError, 'user with this Kerberos principal already exists: %s' % krb_principal
         
-        return context.session.createUser(username, status=status, krb_principal=krb_principal)
+        return context.session.createUser(username, status=status, krb_principal=krb_principal, email=email)
 
     def enableUser(self, username):
         """Enable logins by the specified user"""
