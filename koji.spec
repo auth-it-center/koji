@@ -1,6 +1,6 @@
 %{!?python_sitelib: %define python_sitelib %(%{__python} -c "from distutils.sysconfig import get_python_lib; print get_python_lib()")}
 
-%define baserelease 3%{?distribution}
+%define baserelease 4%{?distribution}
 #build with --define 'testbuild 1' to have a timestamp appended to release
 %if "x%{?testbuild}" == "x1"
 %define release %{baserelease}.%(date +%%Y%%m%%d.%%H%%M.%%S)
@@ -191,6 +191,9 @@ if [ $1 = 0 ]; then
 fi
 
 %changelog
+* Wed Mar 31 2010 Christos Triantafyllidis <ctria@grid.auth.gr> - 1.3.2-4%{?distribution}
+- Fixed email support
+
 * Tue Mar 30 2010 Christos Triantafyllidis <ctria@grid.auth.gr> - 1.3.2-3%{?distribution}
 - Added email field at users and used it for notifications
 
