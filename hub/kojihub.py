@@ -2713,16 +2713,17 @@ def get_user(userInfo=None,strict=False):
       name: user name
       status: user status (int), may be null
       usertype: user type (int), 0 person, 1 for host, may be null
-      krb_principal: the user's Kerberos principal"""
+      krb_principal: the user's Kerberos principal
+      email: user's email"""
     if userInfo is None:
         userInfo = context.session.user_id
         #will still be None if not logged in
-    fields = ('id', 'name', 'status', 'usertype', 'krb_principal')
+    fields = ('id', 'name', 'status', 'usertype', 'krb_principal','email')
     q = """SELECT %s FROM users WHERE""" % ', '.join(fields)
     if isinstance(userInfo, int) or isinstance(userInfo, long):
         q += """ id = %(userInfo)i"""
     elif isinstance(userInfo, str):
-        q += """ (krb_principal = %(userInfo)s or name = %(userInfo)s)"""
+        q += """ (email = %(userInfo)s or krb_principal = %(userInfo)s or name = %(userInfo)s)"""
     else:
         raise koji.GenericError, 'invalid type for userInfo: %s' % type(userInfo)
     return _singleRow(q,locals(),fields,strict=strict)
@@ -4046,12 +4047,12 @@ def get_notification_recipients(build, tag_id, state):
 
     if notify_on_success is True or state != koji.BUILD_STATES['COMPLETE']:
         # user who submitted the build
-				emails.append(build['owner_email'])
+        emails.append(build['owner_email'])
 
         if tag_id:
             packages = readPackageList(pkgID=package_id, tagID=tag_id, inherit=True)
             # owner of the package in this tag, following inheritance
-						emails.append(packages[package_id]['owner_email'])
+            emails.append(packages[package_id]['owner_email'])
         #FIXME - if tag_id is None, we don't have a good way to get the package owner.
         #   using all package owners from all tags would be way overkill.
 
