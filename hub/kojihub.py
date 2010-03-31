@@ -6791,7 +6791,7 @@ class RootExports(object):
             raise koji.GenericError, 'user %s cannot create notifications for user %s' % \
                   (currentUser['name'], notificationUser['name'])
         
-        email = '%s@%s' % (notificationUser['name'], context.opts['EmailDomain'])
+        email = notificationUser['email']
         insert = """INSERT INTO build_notifications
         (user_id, package_id, tag_id, success_only, email)
         VALUES
