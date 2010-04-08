@@ -64,17 +64,23 @@ def _(args):
     """Stub function for translation"""
     return args
 
-def arg_filter(str):
+ARGMAP = {'None': None,
+          'True': True,
+          'False': False}
+
+def arg_filter(arg):
     try:
-        return int(str)
+        return int(arg)
     except ValueError:
         pass
     try:
-        return float(str)
+        return float(arg)
     except ValueError:
         pass
-    #handle lists?
-    return str
+    if arg in ARGMAP:
+        return ARGMAP[arg]
+    #handle lists/dicts?
+    return arg
 
 def get_options():
     """process options from command line and config file"""
@@ -486,6 +492,48 @@ def handle_add_host(options, session, args):
         if id:
             print "%s added: id %d" % (host, id)
 
+def handle_edit_host(options, session, args):
+    "[admin] Edit a host"
+    usage = _("usage: %prog edit-host hostname ... [options]")
+    usage += _("\n(Specify the --help global option for a list of other help options)")
+    parser = OptionParser(usage=usage)
+    parser.add_option("--arches", help=_("Space-separated list of supported architectures"))
+    parser.add_option("--capacity", type="float", help=_("Capacity of this host"))
+    parser.add_option("--description", metavar="DESC", help=_("Description of this host"))
+    parser.add_option("--comment", help=_("A brief comment about this host"))
+    (subopts, args) = parser.parse_args(args)
+    if not args:
+        parser.error(_("Please specify a hostname"))
+
+    activate_session(session)
+
+    vals = {}
+    for key, val in subopts.__dict__.items():
+        if val is not None:
+            vals[key] = val
+
+    session.multicall = True
+    for host in args:
+        session.getHost(host)
+    error = False
+    for host, [info] in zip(args, session.multiCall(strict=True)):
+        if not info:
+            print _("Host %s does not exist") % host
+            error = True
+
+    if error:
+        print _("No changes made, please correct the command line")
+        return 1
+
+    session.multicall = True
+    for host in args:
+        session.editHost(host, **vals)
+    for host, [result] in zip(args, session.multiCall(strict=True)):
+        if result:
+            print _("Edited %s") % host
+        else:
+            print _("No changes made to %s") % host
+
 def handle_add_host_to_channel(options, session, args):
     "[admin] Add a host to a channel"
     usage = _("usage: %prog add-host-to-channel [options] hostname channel")
@@ -497,14 +545,13 @@ def handle_add_host_to_channel(options, session, args):
         parser.error(_("Please specify a hostname and a channel"))
         assert False
     activate_session(session)
-    channels = dict([(p['name'], p['id']) for p in session.getAllChannels()])
     if options.list:
-        for p in channels.keys():
-            print p
+        for channel in session.listChannels():
+            print channel['name']
         return
     channel = args[1]
-    channel_id = channels.get(channel, None)
-    if not channel_id:
+    channelinfo = session.getChannel(channel)
+    if not channelinfo:
         print "No such channel: %s" % channel
         return 1
     host = args[0]
@@ -529,11 +576,10 @@ def handle_remove_host_from_channel(options, session, args):
     if not hostinfo:
         print "No such host: %s" % host
         return 1
-    hostchannels = dict([(p['name'], p['id']) for p in session.listChannels(hostinfo['id'])])
+    hostchannels = [c['name'] for c in session.listChannels(hostinfo['id'])]
 
     channel = args[1]
-    channel_id = hostchannels.get(channel, None)
-    if not channel_id:
+    if channel not in hostchannels:
         print "Host %s is not a member of channel %s" % (host, channel)
         return 1
     
@@ -751,9 +797,7 @@ def handle_chain_build(options, session, args):
     build_target = session.getBuildTarget(target)
     if not build_target:
         parser.error(_("Unknown build target: %s" % target))
-    dest_tag = session.getTag(build_target['dest_tag'])
-    if not dest_tag:
-        parser.error(_("Unknown destination tag: %s" % build_target['dest_tag_name']))
+    dest_tag = session.getTag(build_target['dest_tag'], strict=True)
     if dest_tag['locked']:
         parser.error(_("Destination tag %s is locked" % dest_tag['name']))
 
@@ -848,24 +892,12 @@ def handle_call(options, session, args):
     non_kw = []
     kw = {}
 
-    def _convarg(val):
-        valmap = {'None': None,
-                  'True': True,
-                  'False': False}
-        
-        if val.isdigit():
-            return int(val)
-        elif valmap.has_key(val):
-            return valmap[val]
-        else:
-            return val
-    
     for arg in args[1:]:
         if arg.find('=') != -1:
             key, value = arg.split('=', 1)
-            kw[key] = _convarg(value)
+            kw[key] = arg_filter(value)
         else:
-            non_kw.append(_convarg(arg))
+            non_kw.append(arg_filter(arg))
     pprint.pprint(getattr(session, name).__call__(*non_kw, **kw))
 
 def anon_handle_mock_config(options, session, args):
@@ -951,42 +983,58 @@ def anon_handle_mock_config(options, session, args):
         print output
 
 def handle_disable_host(options, session, args):
-    "[admin] Mark a host as disabled"
-    usage = _("usage: %prog disable-host [options] hostname")
+    "[admin] Mark one or more hosts as disabled"
+    usage = _("usage: %prog disable-host [options] hostname ...")
     usage += _("\n(Specify the --help global option for a list of other help options)")
     parser = OptionParser(usage=usage)
+    parser.add_option("--comment", help=_("Comment indicating why the host(s) are being disabled"))
     (options, args) = parser.parse_args(args)
-    if len(args) != 1:
-        parser.error(_("Exactly one argument (a hostname) is required"))
-        assert False
-    host = args[0]
-    
-    activate_session(session)
-    id = session.getHost(host)
-    if not id:
-        print "Host %s does not exist" % host
-        return 1
 
-    session.disableHost(host)
+    activate_session(session)
+    session.multicall = True
+    for host in args:
+        session.getHost(host)
+    error = False
+    for host, [id] in zip(args, session.multiCall(strict=True)):
+        if not id:
+            print "Host %s does not exist" % host
+            error = True
+    if error:
+        print "No changes made. Please correct the command line."
+        return 1
+    session.multicall = True
+    for host in args:
+        session.disableHost(host)
+        if options.comment:
+            session.editHost(host, comment=options.comment)
+    session.multiCall(strict=True)
 
 def handle_enable_host(options, session, args):
-    "[admin] Mark a host as enabled"
-    usage = _("usage: %prog enable-host [options] hostname")
+    "[admin] Mark one or more hosts as enabled"
+    usage = _("usage: %prog enable-host [options] hostname ...")
     usage += _("\n(Specify the --help global option for a list of other help options)")
     parser = OptionParser(usage=usage)
+    parser.add_option("--comment", help=_("Comment indicating why the host(s) are being enabled"))
     (options, args) = parser.parse_args(args)
-    if len(args) != 1:
-        parser.error(_("Exactly one argument (a hostname) is required"))
-        assert False
-    host = args[0]
-    
-    activate_session(session)
-    id = session.getHost(host)
-    if not id:
-        print "Host %s does not exist" % host
-        return 1
 
-    session.enableHost(host)
+    activate_session(session)
+    session.multicall = True
+    for host in args:
+        session.getHost(host)
+    error = False
+    for host, [id] in zip(args, session.multiCall(strict=True)):
+        if not id:
+            print "Host %s does not exist" % host
+            error = True
+    if error:
+        print "No changes made. Please correct the command line."
+        return 1
+    session.multicall = True
+    for host in args:
+        session.enableHost(host)
+        if options.comment:
+            session.editHost(host, comment=options.comment)
+    session.multiCall(strict=True)
 
 def handle_import(options, session, args):
     "[admin] Import local RPMs to the database"
@@ -3270,7 +3318,7 @@ def anon_handle_taginfo(options, session, args):
                     flags += '.'
             parent['flags'] = flags
             print "  %(priority)-4d %(flags)s %(name)s [%(parent_id)s]" % parent
-            if parent['maxdepth']:
+            if parent['maxdepth'] is not None:
                 print "    maxdepth: %(maxdepth)s" % parent
             if parent['pkg_filter']:
                 print "    package filter: %(pkg_filter)s" % parent

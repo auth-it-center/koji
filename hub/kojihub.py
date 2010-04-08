@@ -31,12 +31,10 @@ import koji.policy
 import datetime
 import errno
 import logging
-import logging.handlers
 import fcntl
 import fnmatch
 from koji.util import md5_constructor
 import os
-import pgdb
 import random
 import re
 import rpm
@@ -49,12 +47,15 @@ import types
 import xmlrpclib
 from koji.context import context
 
+
+logger = logging.getLogger('koji.hub')
+
 def log_error(msg):
     if hasattr(context,'req'):
         context.req.log_error(msg)
     else:
         sys.stderr.write(msg + "\n")
-    logging.getLogger('koji.hub').error(msg)
+    logger.error(msg)
 
 
 class Task(object):
@@ -790,12 +791,14 @@ def _pkglist_add(tag_id,pkg_id,owner,block,extra_arches,event_id=None):
 
 def pkglist_add(taginfo,pkginfo,owner=None,block=None,extra_arches=None,force=False,update=False):
     """Add to (or update) package list for tag"""
-    #only admins....
-    context.session.assertPerm('admin')
+    #access control comes a little later (via an assert_policy)
+    #should not make any changes until after policy is checked
     tag = get_tag(taginfo, strict=True)
-    pkg = lookup_package(pkginfo, create=True)
     tag_id = tag['id']
-    pkg_id = pkg['id']
+    pkg = lookup_package(pkginfo, strict=False)
+    if not pkg:
+        if not isinstance(pkginfo, basestring):
+            raise GenericError, "Invalid package: %s" % pkginfo
     if owner is not None:
         owner = get_user(owner,strict=True)['id']
     action = 'add'
@@ -803,13 +806,20 @@ def pkglist_add(taginfo,pkginfo,owner=None,block=None,extra_arches=None,force=Fa
         action = 'update'
     elif bool(block):
         action = 'block'
+    context.session.assertLogin()
+    policy_data = {'tag' : tag_id, 'action' : action, 'package' : pkginfo, 'force' : force}
+    #don't check policy for admins using force
+    if not force or not context.session.hasPerm('admin'):
+        assert_policy('package_list', policy_data)
+    if not pkg:
+        pkg = lookup_package(pkginfo, create=True)
     koji.plugin.run_callbacks('prePackageListChange', action=action, tag=tag, package=pkg, owner=owner,
                               block=block, extra_arches=extra_arches, force=force, update=update)
     # first check to see if package is:
     #   already present (via inheritance)
     #   blocked
-    pkglist = readPackageList(tag_id, pkgID=pkg_id, inherit=True)
-    previous = pkglist.get(pkg_id,None)
+    pkglist = readPackageList(tag_id, pkgID=pkg['id'], inherit=True)
+    previous = pkglist.get(pkg['id'],None)
     if previous is None:
         if block is None:
             block = False
@@ -847,7 +857,7 @@ def pkglist_add(taginfo,pkginfo,owner=None,block=None,extra_arches=None,force=Fa
             owner = context.session.user_id
         else:
             raise koji.GenericError, "owner not specified"
-    _pkglist_add(tag_id,pkg_id,owner,block,extra_arches)
+    _pkglist_add(tag_id, pkg['id'], owner, block, extra_arches)
     koji.plugin.run_callbacks('postPackageListChange', action=action, tag=tag, package=pkg, owner=owner,
                               block=block, extra_arches=extra_arches, force=force, update=update)
 
@@ -859,10 +869,13 @@ def pkglist_remove(taginfo,pkginfo,force=False):
     The main reason to remove an entry like this is to remove an override so
     that the package data can be inherited from elsewhere.
     """
-    #only admins....
-    context.session.assertPerm('admin')
     tag = get_tag(taginfo, strict=True)
     pkg = lookup_package(pkginfo, strict=True)
+    context.session.assertLogin()
+    policy_data = {'tag' : tag['id'], 'action' : 'remove', 'package' : pkg['id'], 'force' : force}
+    #don't check policy for admins using force
+    if not force or not context.session.hasPerm('admin'):
+        assert_policy('package_list', policy_data)
     koji.plugin.run_callbacks('prePackageListChange', action='remove', tag=tag, package=pkg)
     _pkglist_remove(tag['id'],pkg['id'])
     koji.plugin.run_callbacks('postPackageListChange', action='remove', tag=tag, package=pkg)
@@ -871,7 +884,7 @@ def pkglist_block(taginfo,pkginfo):
     """Block the package in tag"""
     pkglist_add(taginfo,pkginfo,block=True)
 
-def pkglist_unblock(taginfo,pkginfo):
+def pkglist_unblock(taginfo, pkginfo, force=False):
     """Unblock the package in tag
 
     Generally this just adds a unblocked duplicate of the blocked entry.
@@ -879,6 +892,11 @@ def pkglist_unblock(taginfo,pkginfo):
     the blocking entry is simply removed"""
     tag = get_tag(taginfo, strict=True)
     pkg = lookup_package(pkginfo, strict=True)
+    context.session.assertLogin()
+    policy_data = {'tag' : tag['id'], 'action' : 'unblock', 'package' : pkg['id'], 'force' : force}
+    #don't check policy for admins using force
+    if not force or not context.session.hasPerm('admin'):
+        assert_policy('package_list', policy_data)
     koji.plugin.run_callbacks('prePackageListChange', action='unblock', tag=tag, package=pkg)
     tag_id = tag['id']
     pkg_id = pkg['id']
@@ -1687,7 +1705,7 @@ def readTagGroups(tag,event=None,inherit=True,incl_pkgs=True,incl_reqs=True):
 def set_host_enabled(hostname, enabled=True):
     context.session.assertPerm('admin')
     if not get_host(hostname):
-        raise koji.GenericError, 'host does not exists: %s' % hostname
+        raise koji.GenericError, 'host does not exist: %s' % hostname
     c = context.cnx.cursor()
     c.execute("""UPDATE host SET enabled = %(enabled)s WHERE name = %(hostname)s""", locals())
     context.commit_pending = True
@@ -1696,11 +1714,11 @@ def add_host_to_channel(hostname, channel_name):
     context.session.assertPerm('admin')
     host = get_host(hostname)
     if host == None:
-        raise koji.GenericError, 'host does not exists: %s' % hostname
+        raise koji.GenericError, 'host does not exist: %s' % hostname
     host_id = host['id']
     channel_id = get_channel_id(channel_name)
     if channel_id == None:
-        raise koji.GenericError, 'channel does not exists: %s' % channel_name
+        raise koji.GenericError, 'channel does not exist: %s' % channel_name
     channels = list_channels(host_id)
     for channel in channels:
         if channel['id'] == channel_id:
@@ -1713,11 +1731,11 @@ def remove_host_from_channel(hostname, channel_name):
     context.session.assertPerm('admin')
     host = get_host(hostname)
     if host == None:
-        raise koji.GenericError, 'host does not exists: %s' % hostname
+        raise koji.GenericError, 'host does not exist: %s' % hostname
     host_id = host['id']
     channel_id = get_channel_id(channel_name)
     if channel_id == None:
-        raise koji.GenericError, 'channel does not exists: %s' % channel_name
+        raise koji.GenericError, 'channel does not exist: %s' % channel_name
     found = False
     channels = list_channels(host_id)
     for channel in channels:
@@ -2995,11 +3013,13 @@ def get_host(hostInfo, strict=False):
     - arches
     - task_load
     - capacity
+    - description
+    - comment
     - ready
     - enabled
     """
     fields = ('id', 'user_id', 'name', 'arches', 'task_load',
-              'capacity', 'ready', 'enabled')
+              'capacity', 'description', 'comment', 'ready', 'enabled')
     query = """SELECT %s FROM host
     WHERE """ % ', '.join(fields)
     if isinstance(hostInfo, int) or isinstance(hostInfo, long):
@@ -3010,6 +3030,42 @@ def get_host(hostInfo, strict=False):
         raise koji.GenericError, 'invalid type for hostInfo: %s' % type(hostInfo)
 
     return _singleRow(query, locals(), fields, strict)
+
+def edit_host(hostInfo, **kw):
+    """Edit information for an existing host.
+    hostInfo specifies the host to edit, either as an integer (id)
+    or a string (name).
+    fields to be changed are specified as keyword parameters:
+    - arches
+    - capacity
+    - description
+    - comment
+
+    Returns True if changes are made to the database, False otherwise.
+    """
+    context.session.assertPerm('admin')
+
+    host = get_host(hostInfo, strict=True)
+
+    fields = ('arches', 'capacity', 'description', 'comment')
+    changes = []
+    for field in fields:
+        if field in kw and kw[field] != host[field]:
+            changed = True
+            if field == 'capacity':
+                # capacity is a float, so set the substitution format appropriately
+                changes.append('%s = %%(%s)f' % (field, field))
+            else:
+                changes.append('%s = %%(%s)s' % (field, field))
+
+    if not changes:
+        return False
+
+    update = 'UPDATE host set ' + ', '.join(changes) + ' where id = %(id)i'
+    data = kw.copy()
+    data['id'] = host['id']
+    _dml(update, data)
+    return True
 
 def get_channel(channelInfo, strict=False):
     """Return information about a channel."""
@@ -4385,13 +4441,49 @@ class OperationTest(koji.policy.MatchTest):
     name = 'operation'
     field = 'operation'
 
+def policy_get_user(data):
+    """Determine user from policy data (default to logged-in user)"""
+    if data.has_key('user_id'):
+        return get_user(data['user_id'])
+    elif context.session.logged_in:
+        return get_user(context.session.user_id)
+    return None
+
+def policy_get_pkg(data):
+    """Determine package from policy data (default to logged-in user)
+
+    returns dict as lookup_package
+    if package does not exist yet, the id field will be None
+    """
+    if data.has_key('package'):
+        pkginfo = lookup_package(data['package'], strict=False)
+        if not pkginfo:
+            #for some operations (e.g. adding a new package), the package
+            #entry may not exist yet
+            if isinstance(data['package'], basestring):
+                return {'id' : None, 'name' : data['package']}
+            else:
+                raise koji.GenericError, "Invalid package: %s" % data['package']
+        return pkginfo
+    if data.has_key('build'):
+        binfo = get_build(data['build'], strict=True)
+        return {'id' : binfo['package_id'], 'name' : binfo['name']}
+    #else
+    raise koji.GenericError, "policy requires package data"
+
+class NewPackageTest(koji.policy.BaseSimpleTest):
+    """Checks to see if a package exists yet"""
+    name = 'is_new_package'
+    def run(self, data):
+        return (policy_get_pkg(data)['id'] is None)
+
 class PackageTest(koji.policy.MatchTest):
     """Checks package against glob patterns"""
     name = 'package'
     field = '_package'
     def run(self, data):
         #we need to find the package name from the base data
-        data[self.field] = get_build(data['build'])['name']
+        data[self.field] = policy_get_pkg(data)['name']
         return super(PackageTest, self).run(data)
 
 class TagTest(koji.policy.MatchTest):
@@ -4503,7 +4595,9 @@ class IsBuildOwnerTest(koji.policy.BaseSimpleTest):
     def run(self, data):
         build = get_build(data['build'])
         owner = get_user(build['owner_id'])
-        user = get_user(data['user_id'])
+        user = policy_get_user(data)
+        if not user:
+            return False
         if owner['id'] == user['id']:
             return True
         if owner['usertype'] == koji.USERTYPES['GROUP']:
@@ -4521,7 +4615,9 @@ class UserInGroupTest(koji.policy.BaseSimpleTest):
     """
     name = "user_in_group"
     def run(self, data):
-        user = get_user(data['user_id'])
+        user = policy_get_user(data)
+        if not user:
+            return False
         groups = koji.auth.get_user_groups(user['id'])
         args = self.str.split()[1:]
         for group_id, group in groups.iteritems():
@@ -4539,7 +4635,9 @@ class HasPermTest(koji.policy.BaseSimpleTest):
     """
     name = "has_perm"
     def run(self, data):
-        user = get_user(data['user_id'])
+        user = policy_get_user(data)
+        if not user:
+            return False
         perms = koji.auth.get_user_perms(user['id'])
         args = self.str.split()[1:]
         for perm in perms:
@@ -4963,8 +5061,7 @@ class RootExports(object):
         # the chunk rather than the whole file. the offset indicates where
         # the chunk belongs
         # the special offset -1 is used to indicate the final chunk
-        if not context.session.logged_in:
-            raise koji.GenericError, 'you must be logged-in to upload a file'
+        context.session.assertLogin()
         contents = base64.decodestring(data)
         del data
         # we will accept offset and size as strings to work around xmlrpc limits
@@ -5217,7 +5314,6 @@ class RootExports(object):
         elif pkgs[pkg_id]['blocked']:
             pkg_error = "Package %s blocked in %s" % (build['name'], tag['name'])
         policy_data = {'tag' : tag_id, 'build' : build_id, 'fromtag' : fromtag_id}
-        policy_data['user_id'] = context.session.user_id
         if fromtag is None:
             policy_data['operation'] = 'tag'
         else:
@@ -5248,7 +5344,6 @@ class RootExports(object):
         tag_id = get_tag(tag, strict=True)['id']
         build_id = get_build(build, strict=True)['id']
         policy_data = {'tag' : None, 'build' : build_id, 'fromtag' : tag_id}
-        policy_data['user_id'] = context.session.user_id
         policy_data['operation'] = 'untag'
         try:
             #don't check policy for admins using force
@@ -5312,7 +5407,6 @@ class RootExports(object):
 
         #policy check
         policy_data = {'tag' : tag2, 'fromtag' : tag1, 'operation' : 'move'}
-        policy_data['user_id'] = context.session.user_id
         #don't check policy for admins using force
         if not force or not context.session.hasPerm('admin'):
             for build in build_list:
@@ -6506,6 +6600,7 @@ class RootExports(object):
         set_host_enabled(hostname, False)
 
     getHost = staticmethod(get_host)
+    editHost = staticmethod(edit_host)
     addHostToChannel = staticmethod(add_host_to_channel)
     removeHostFromChannel = staticmethod(remove_host_from_channel)
 
@@ -6597,18 +6692,6 @@ class RootExports(object):
         - name
         """
         query = """SELECT id, name FROM permissions
-        ORDER BY id"""
-
-        return _multiRow(query, {}, ['id', 'name'])
-
-    def getAllChannels(self):
-        """Get a list of all channels in the system.  Returns a list of maps.  Each
-        map contains the following keys:
-
-        - id
-        - name
-        """
-        query = """SELECT id, name FROM channels
         ORDER BY id"""
 
         return _multiRow(query, {}, ['id', 'name'])

@@ -47,6 +47,7 @@ Group: Applications/Internet
 License: LGPLv2
 Requires: %{name} = %{version}-%{release}
 Requires: %{name}-hub = %{version}-%{release}
+Requires: python-qpid
 
 %description hub-plugins
 Plugins to the koji XMLRPC interface
@@ -66,8 +67,6 @@ Requires(pre): /usr/sbin/useradd
 Requires: /usr/bin/cvs
 Requires: /usr/bin/svn
 Requires: /usr/bin/git
-Requires: rpm-build
-Requires: redhat-rpm-config
 %if 0%{?rhel} >= 5
 Requires: createrepo >= 0.4.11-2
 %endif
@@ -128,13 +127,16 @@ rm -rf $RPM_BUILD_ROOT
 %{_datadir}/koji-hub
 %dir %{_libexecdir}/koji-hub
 %{_libexecdir}/koji-hub/rpmdiff
-%config(noreplace) /etc/httpd/conf.d/kojihub.conf
-%config(noreplace) /etc/koji-hub/hub.conf
+%config(noreplace) %{_sysconfdir}/httpd/conf.d/kojihub.conf
+%dir %{_sysconfdir}/koji-hub
+%config(noreplace) %{_sysconfdir}/koji-hub/hub.conf
 
 %files hub-plugins
 %defattr(-,root,root)
 %dir %{_prefix}/lib/koji-hub-plugins
 %{_prefix}/lib/koji-hub-plugins/*.py*
+%dir %{_sysconfdir}/koji-hub/plugins
+%{_sysconfdir}/koji-hub/plugins/*.conf
 
 %files utils
 %defattr(-,root,root)
@@ -154,7 +156,7 @@ rm -rf $RPM_BUILD_ROOT
 %defattr(-,root,root)
 %{_datadir}/koji-web
 %{_sysconfdir}/kojiweb
-%config(noreplace) /etc/httpd/conf.d/kojiweb.conf
+%config(noreplace) %{_sysconfdir}/httpd/conf.d/kojiweb.conf
 
 %files builder
 %defattr(-,root,root)
@@ -166,7 +168,7 @@ rm -rf $RPM_BUILD_ROOT
 %dir %{_sysconfdir}/kojid
 %config(noreplace) %{_sysconfdir}/kojid/kojid.conf
 %{_datadir}/koji-builder
-%attr(-,kojibuilder,kojibuilder) /etc/mock/koji
+%attr(-,kojibuilder,kojibuilder) %{_sysconfdir}/mock/koji
 
 %pre builder
 /usr/sbin/useradd -r -s /bin/bash -G mock -d /builddir -M kojibuilder 2>/dev/null ||:
