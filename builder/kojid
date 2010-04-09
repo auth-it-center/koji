@@ -782,6 +782,10 @@ class TaskManager(object):
                             self.logger.info("%s: clearing rootdir" % desc)
                         for fn in flist:
                             safe_rmtree("%s/%s" % (rootdir,fn), unmount=True, strict=False)
+                        resultdir = "%s/result" % topdir
+                        if os.path.isdir(resultdir):
+                            self.logger.info("%s: clearing resultdir" % desc)
+                            safe_rmtree(resultdir, unmount=True, strict=False)
                 else:
                     self.logger.debug("Recent buildroot: %s: %i seconds" % (desc,age))
         self.logger.debug("Local buildroots: %d" % len(local_br))
@@ -1711,47 +1715,53 @@ class ChainBuildTask(BaseTaskHandler):
     _taskWeight = 0.1
 
     def handler(self, srcs, target, opts=None):
+        """Run a chain build
+
+            target and opts are passed on to the build tasks
+            srcs is a list of "build levels"
+            each build level is a list of strings, each string may be one of:
+                - a build src (SCM url only)
+                - an n-v-r
+            each build level is processed in order
+            successive levels are only started once the previous levels have completed
+            and gotten into the repo.
+        """
         if opts.get('scratch'):
             raise koji.BuildError, "--scratch is not allowed with chain-builds"
         target_info = session.getBuildTarget(target)
         if not target_info:
             raise koji.GenericError, 'unknown build target: %s' % target
-        for build_level in srcs:
-            subtasks = []
-            build_tasks = []
+        nvrs = []
+        for n_src, build_level in enumerate(srcs):
+            #if there are any nvrs to wait on, do so
+            if nvrs:
+                task_id = session.host.subtask(method='waitrepo',
+                                               arglist=[target_info['build_tag_name'], None, nvrs],
+                                               label="wait %i" % n_src,
+                                               parent=self.id)
+                self.wait(task_id, all=True, failany=True)
             nvrs = []
+            #kick off the builds for this level
+            build_tasks = []
             for src in build_level:
                 if SCM.is_scm_url(src):
                     task_id = session.host.subtask(method='build',
                                                    arglist=[src, target, opts],
-                                                   label=src,
+                                                   label="build %i" % n_src,
                                                    parent=self.id)
                     build_tasks.append(task_id)
-                    subtasks.append(task_id)
                 else:
                     nvrs.append(src)
-            if nvrs:
-                task_id = session.host.subtask(method='waitrepo',
-                                               arglist=[target_info['build_tag_name'], None, nvrs],
-                                               label=','.join(nvrs),
-                                               parent=self.id)
-                subtasks.append(task_id)
-            if not subtasks:
-                continue
-            self.wait(subtasks, all=True, failany=True)
-            if srcs[-1] == build_level:
-                continue
-            nvrs = []
+                    #next pass will wait for these
+            if build_tasks:
+                #the level could have been all nvrs
+                self.wait(build_tasks, all=True, failany=True)
+            #see what builds we created in this batch so the next pass can wait for them also
             for build_task in build_tasks:
                 builds = session.listBuilds(taskID=build_task)
                 if builds:
                     nvrs.append(builds[0]['nvr'])
-            if nvrs:
-                task_id = session.host.subtask(method='waitrepo',
-                                               arglist=[target_info['build_tag_name'], None, nvrs],
-                                               label=','.join(nvrs),
-                                               parent=self.id)
-                self.wait(task_id, all=True, failany=True)
+
 
 class BuildTask(BaseTaskHandler):
 
@@ -2035,6 +2045,9 @@ class BuildArchTask(BaseTaskHandler):
         avg = session.getAverageBuildDuration(name)
         if not avg:
             return
+        if avg < 0:
+            self.logger.warn("Negative average build duration for %s: %s", name, avg)
+            return
         # increase the task weight by 0.75 for every hour of build duration
         adj = (avg / 4800.0)
         # cap the adjustment at +4.5
@@ -2215,9 +2228,10 @@ class LiveCDTask(BaseTaskHandler):
         #		'/dev/loop7' : '/dev/loop7'}}
         bind_opts = {'dirs' : {
                          '/dev/pts' : '/dev/pts',
+                         '/dev/shm' : '/dev/shm',
                          '/dev/mapper' : '/dev/mapper',
                          '/selinux' : '/selinux'}
-                     }
+                    }
         rootopts = {'install_group': 'livecd-build',
                     'setup_dns': True,
                     'repo_id': repo_info['id'],
@@ -2316,21 +2330,25 @@ class LiveCDTask(BaseTaskHandler):
         livecd_log = os.path.join(tmpchroot, 'livecd.log')  # path in chroot
 
         # Create the loopback devices we need
-        mknod_cmd = 'for i in $(seq 0 7); do mknod /dev/loop$i b 7 $i; done'
-        rv = broot.mock(['--chroot', mknod_cmd])
+        cmd = 'for i in $(seq 0 7); do mknod /dev/loop$i b 7 $i; done'
+        rv = broot.mock(['--chroot', cmd])
         if rv:
             broot.expire()
             raise koji.LiveCDError, \
-                "Could not create loopback device files: %s" % _parseStatus(rv, '"%s"' % mknod_cmd)
+                "Could not create loopback device files: %s" % _parseStatus(rv, '"%s"' % cmd)
+
+        # Create /dev/urandom
+        cmd = 'mknod /dev/urandom c 1 9'
+        rv = broot.mock(['--chroot', cmd])
+        if rv:
+            broot.expire()
+            raise koji.LiveCDError, \
+                "Could not create /dev/urandom: %s" % _parseStatus(rv, '"%s"' % cmd)
 
         # Run livecd-creator
-        livecd_cmd = ['/usr/bin/livecd-creator', '-c', kskoji, '-d', '-v', '--logfile', livecd_log,
-                      '--cache', cachedir]
-
-        # run the livecd-creator command
-        rv = broot.mock(['--cwd', '/tmp', '--chroot', '--'] + livecd_cmd)
+        cmd = ['/usr/bin/livecd-creator', '-c', kskoji, '-d', '-v', '--logfile', livecd_log, '--cache', cachedir]
+        rv = broot.mock(['--cwd', '/tmp', '--chroot', '--'] + cmd)
         self.uploadFile(os.path.join(broot.rootdir(), livecd_log[1:]))
-        broot.expire()
         if rv:
             raise koji.LiveCDError, \
                 "Could not create LiveCD: %s" % _parseStatus(rv, 'livecd-creator') + \
@@ -2419,6 +2437,7 @@ class LiveCDTask(BaseTaskHandler):
             image_id = session.host.importImage(self.id, isofile, filesize, arch,
                                                 'LiveCD ISO', hash, hdrlist)
 
+        broot.expire()
         if opts.get('scratch'):
             return 'Scratch image created: %s' % \
                    os.path.join(koji.pathinfo.work(),
@@ -2838,7 +2857,12 @@ class NewRepoTask(BaseTaskHandler):
             if fn != 'groups' and os.path.isfile("%s/%s/pkglist" % (path, fn)):
                 arches.append(fn)
         #see if we can find a previous repo to update from
-        oldrepo = session.getRepo(tinfo['id'], state=koji.REPO_READY)
+        #only shadowbuild tags should start with SHADOWBUILD, their repos are auto
+        #expired.  so lets get the most recent expired tag for newRepo shadowbuild tasks.
+        if tag.startswith('SHADOWBUILD'):
+            oldrepo = session.getRepo(tinfo['id'], state=koji.REPO_EXPIRED)
+        else:
+            oldrepo = session.getRepo(tinfo['id'], state=koji.REPO_READY)
         subtasks = {}
         external_repos = session.getExternalRepoList(tinfo['id'], event=event)
         for arch in arches:
@@ -3482,7 +3506,7 @@ if __name__ == "__main__":
                               keytab=options.keytab,
                               ccache=options.ccache)
         except krbV.Krb5Error, e:
-            quit("Kerberos authentication failed: '%s' (%s)" % (e.message, e.err_code))
+            quit("Kerberos authentication failed: '%s' (%s)" % (e.args[1], e.args[0]))
         except socket.error, e:
             quit("Could not connect to Kerberos authentication service: '%s'" % e.args[1])
     else:
