@@ -52,6 +52,8 @@ import traceback
 import urllib2
 import urlparse
 import xmlrpclib
+import zipfile
+import Cheetah.Template
 from ConfigParser import ConfigParser
 from fnmatch import fnmatch
 from gzip import GzipFile
@@ -59,14 +61,14 @@ from optparse import OptionParser
 from StringIO import StringIO
 from xmlrpclib import Fault
 
-#imports for LiveCD handler
-livecd_enabled = False
+#imports for LiveCD and Appliance handler
+image_enabled = False
 try:
     import pykickstart.parser as ksparser
     import pykickstart.handlers.control as kscontrol
     import hashlib
     import iso9660 # from pycdio
-    livecd_enabled = True
+    image_enabled = True
 except ImportError:
     pass
 
@@ -322,7 +324,7 @@ class BuildRoot(object):
         self.name = "%(tag_name)s-%(id)s-%(repoid)s" % vars(self)
         self.config = session.getBuildConfig(self.tag_id, event=self.event_id)
 
-    def _new(self, tag, arch, task_id, repo_id=None, install_group='build', setup_dns=False, bind_opts=None):
+    def _new(self, tag, arch, task_id, repo_id=None, install_group='build', setup_dns=False, bind_opts=None, maven_opts=None):
         """Create a brand new repo"""
         if not repo_id:
             raise koji.BuildrootError, "A repo id must be provided"
@@ -355,6 +357,7 @@ class BuildRoot(object):
         self.name = "%(tag_name)s-%(id)s-%(repoid)s" % vars(self)
         self.install_group = install_group
         self.setup_dns = setup_dns
+        self.maven_opts = maven_opts
         self.bind_opts = bind_opts
         self._writeMockConfig()
 
@@ -375,12 +378,57 @@ class BuildRoot(object):
         opts['buildroot_id'] = self.id
         opts['use_host_resolv'] = self.setup_dns
         opts['install_group'] = self.install_group
+        opts['maven_opts'] = self.maven_opts
         opts['bind_opts'] = self.bind_opts
         output = koji.genMockConfig(self.name, self.br_arch, managed=True, **opts)
 
         #write config
         fo = file(configfile,'w')
         fo.write(output)
+        fo.close()
+
+    def writeMavenSettings(self, localrepodir, destfile):
+        """
+        Write the Maven settings.xml file to the specified destination.
+        """
+        repo_id = self.repoid
+        tag_name = self.tag_name
+
+        global options
+        topurl = None
+        topdir = None
+        if hasattr(options, 'topurl'):
+            topurl = options.topurl
+        if hasattr(options, 'topdir'):
+            topdir = options.topdir
+        if topurl:
+            pi = koji.PathInfo(topdir=topurl)
+            repourl = pi.repo(repo_id, tag_name) + '/maven2'
+        elif topdir:
+            pi = koji.PathInfo(topdir=topdir)
+            repourl = 'file://' + pi.repo(repo_id, tag_name) + '/maven2'
+        else:
+            raise koji.BuildError, 'either topurl or topdir must be specified in the config file'
+        localrepo = localrepodir[len(self.rootdir()):]
+
+        settings = """<settings xmlns="http://maven.apache.org/POM/4.0.0"
+  xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+  xsi:schemaLocation="http://maven.apache.org/POM/4.0.0
+                      http://maven.apache.org/xsd/settings-1.0.0.xsd">
+  <localRepository>%(localrepo)s</localRepository>
+  <interactiveMode>false</interactiveMode>
+  <mirrors>
+    <mirror>
+      <id>koji-maven-repo-%(tag_name)s-%(repo_id)i</id>
+      <name>Koji-managed Maven repository (%(tag_name)s-%(repo_id)i)</name>
+      <url>%(repourl)s</url>
+      <mirrorOf>*</mirrorOf>
+    </mirror>
+  </mirrors>
+</settings>
+""" % locals()
+        fo = file(self.rootdir() + destfile, 'w')
+        fo.write(settings)
         fo.close()
 
     def mock(self, args, skip_setarch=False):
@@ -487,26 +535,28 @@ class BuildRoot(object):
             raise koji.BuildrootError, "could not init mock buildroot, %s" % self._mockResult(rv)
         session.host.setBuildRootList(self.id,self.getPackageList())
 
-    def _mockResult(self, rv):
-        if os.WIFEXITED(rv) and os.WEXITSTATUS(rv) == 1:
+    def _mockResult(self, rv, logfile=None):
+        if logfile:
+            pass
+        elif os.WIFEXITED(rv) and os.WEXITSTATUS(rv) == 1:
             logfile = 'build.log'
         else:
             logfile = 'root.log'
         msg = '; see %s for more information' % logfile
         return _parseStatus(rv, 'mock') + msg
 
-    def build_srpm(self, specfile, sourcedir):
+    def build_srpm(self, specfile, sourcedir, source_cmd):
         session.host.setBuildRootState(self.id,'BUILDING')
-        chroot_sourcedir = sourcedir[len(self.rootdir()):]
-        # call "make sources" in the chroot so any required files not stored in
-        # the SCM can be retrieved
-        args = ['--no-clean', '--unpriv', '--cwd', chroot_sourcedir, '--chroot', 'make', 'sources']
-
-        rv = self.mock(args)
-
-        if rv:
-            self.expire()
-            raise koji.BuildError, "error retrieving sources, %s" % self._mockResult(rv)
+        if source_cmd:
+            # call the command defined by source_cmd in the chroot so any required files not stored in
+            # the SCM can be retrieved
+            chroot_sourcedir = sourcedir[len(self.rootdir()):]
+            args = ['--no-clean', '--unpriv', '--cwd', chroot_sourcedir, '--chroot']
+            args.extend(source_cmd)
+            rv = self.mock(args)
+            if rv:
+                self.expire()
+                raise koji.BuildError, "error retrieving sources, %s" % self._mockResult(rv)
 
         args = ['--no-clean', '--buildsrpm', '--spec', specfile, '--sources', sourcedir]
 
@@ -568,6 +618,79 @@ class BuildRoot(object):
             rpm.delMacro("_dbpath")
         self.markExternalRPMs(ret)
         return ret
+
+    def getMavenPackageList(self, repodir):
+        """Return a list of Maven packages that were installed into the local repo
+        to satisfy build requirements.
+
+        Each member of the list is a dictionary containing the following fields:
+        - maven_info: a dict of Maven info containing the groupId, artifactId, and version fields
+        - files: a list of files associated with that POM
+        """
+        packages = []
+        for path, dirs, files in os.walk(repodir):
+            relpath = path[len(repodir) + 1:]
+            maven_files = []
+            for repofile in files:
+                if os.path.splitext(repofile)[1] in ('.md5', '.sha1'):
+                    # generated by the Koji, not tracked
+                    continue
+                elif fnmatch(repofile, 'maven-metadata*.xml'):
+                    # Maven throws these metadata files around all over the place, ignore them
+                    continue
+                elif relpath == '' and (fnmatch(repofile, '*-sources.zip') or fnmatch(repofile, '*-patches.zip')):
+                    # special-case the archives of the sources and patches, since we drop them in
+                    # root of the output directory
+                    continue
+                else:
+                    maven_files.append({'path': relpath, 'filename': repofile,
+                                        'size': os.path.getsize(os.path.join(path, repofile))})
+            if maven_files:
+                path_comps = relpath.split('/')
+                if len(path_comps) < 3:
+                    raise koji.BuildrootError, 'files found in unexpected path in local Maven repo, directory: %s, files: %s' % \
+                        (relpath, ', '.join([f['filename'] for f in maven_files]))
+                # extract the Maven info from the path within the local repo
+                maven_info = {'version': path_comps[-1],
+                              'artifact_id': path_comps[-2],
+                              'group_id': '.'.join(path_comps[:-2])}
+                packages.append({'maven_info': maven_info, 'files': maven_files})
+
+        return packages
+
+    def mavenBuild(self, sourcedir, outputdir, repodir, settingsfile, props=None, profiles=None):
+        session.host.setBuildRootState(self.id, 'BUILDING')
+        cmd = ['--no-clean', '--chroot', '--unpriv', '--cwd', sourcedir[len(self.rootdir()):], '--',
+               '/usr/bin/mvn', '-s', settingsfile]
+        if profiles:
+            cmd.append('-P%s' % ','.join(profiles))
+        if props:
+            for name, value in props.items():
+                cmd.append('-D%s=%s' % (name, value))
+
+        rv = self.mock(cmd + ['dependency:resolve-plugins'])
+        if rv:
+            self.expire()
+            raise koji.BuildrootError, 'error resolving plugin dependencies, %s' % self._mockResult(rv, logfile='root.log')
+
+        session.host.updateMavenBuildRootList(self.id, self.task_id,
+                                              self.getMavenPackageList(repodir), project=False)
+
+        cmd.extend(['deploy', '-DaltDeploymentRepository=koji-output::default::file://%s' % outputdir[len(self.rootdir()):]])
+        rv = self.mock(cmd, skip_setarch=True)
+
+        # plugin dependencies will be ignored
+        # newly-built archives we find in the repo (we'll import them soon)
+        session.host.updateMavenBuildRootList(self.id, self.task_id, self.getMavenPackageList(repodir),
+                                              ignore=self.getMavenPackageList(outputdir),
+                                              project=True)
+        if rv:
+            self.expire()
+            raise koji.BuildrootError, 'error building Maven package, %s' % self._mockResult(rv, logfile='root.log')
+
+    def scrub(self):
+        "Non-mock implementation of clean"
+        raise koji.FunctionDeprecated, "no longer needed and deprecated. use clean()"
 
     def markExternalRPMs(self, rpmlist):
         """Check rpms against pkgorigins and add external repo data to the external ones
@@ -954,7 +1077,7 @@ class TaskManager(object):
                 self.logger.debug("task is assigned")
                 if self.host_id == task['host_id']:
                     #assigned to us, we can take it regardless
-                    if self.takeTask(task['id']):
+                    if self.takeTask(task):
                         return True
             elif task['state'] == koji.TASK_STATES['FREE']:
                 bin = "%(channel_id)s:%(arch)s" % task
@@ -973,7 +1096,7 @@ class TaskManager(object):
                     #decline for now and give the upper half a chance
                     return False
                 #otherwise, we attempt to open the task
-                if self.takeTask(task['id']):
+                if self.takeTask(task):
                     return True
             else:
                 #should not happen
@@ -1192,15 +1315,15 @@ class TaskManager(object):
         #               io (iostat/vmstat)
         #               network (netstat?)
         global options
-        hostdata = session.host.getHost()
-        self.logger.debug('hostdata: %r' % hostdata)
-        if not hostdata['enabled']:
+        self.hostdata = session.host.getHost()
+        self.logger.debug('hostdata: %r' % self.hostdata)
+        if not self.hostdata['enabled']:
             self.status = "Host is disabled"
             self.logger.info(self.status)
             return False
-        if self.task_load > hostdata['capacity']:
+        if self.task_load > self.hostdata['capacity']:
             self.status = "Over capacity"
-            self.logger.info("Task load (%.2f) exceeds capacity (%.2f)" % (self.task_load, hostdata['capacity']))
+            self.logger.info("Task load (%.2f) exceeds capacity (%.2f)" % (self.task_load, self.hostdata['capacity']))
             return False
         if len(self.tasks) >= options.maxjobs:
             # This serves as a backup to the capacity check and prevents
@@ -1222,18 +1345,35 @@ class TaskManager(object):
         #XXX - add more checks
         return True
 
-    def takeTask(self,task_id):
+    def takeTask(self,task):
         """Attempt to open the specified task
 
         Returns True if successful, False otherwise
         """
-        self.logger.info("Attempting to take task %s" %task_id)
-        data = session.host.openTask(task_id)
+        self.logger.info("Attempting to take task %s" % task['id'])
+        if task['method'] in ('buildArch', 'buildSRPMFromSCM', 'buildMaven') and \
+               task['arch'] == 'noarch':
+            task_info = session.getTaskInfo(task['id'], request=True)
+            if task['method'] == 'buildMaven':
+                tag = task_info['request'][1]
+            else:
+                tag_id = task_info['request'][1]
+                tag = session.getTag(tag_id)
+            if tag and tag['arches']:
+                tag_arches = [koji.canonArch(a) for a in tag['arches'].split()]
+                host_arches = self.hostdata['arches'].split()
+                if not set(tag_arches).intersection(host_arches):
+                    self.logger.info('Skipping task %s (%s) because tag arches (%s) and ' \
+                                     'host arches (%s) are disjoint' % \
+                                     (task['id'], task['method'],
+                                      ', '.join(tag_arches), ', '.join(host_arches)))
+                    return False
+        data = session.host.openTask(task['id'])
         if data is None:
             self.logger.warn("Could not open")
             return False
         if not data.has_key('request') or data['request'] is None:
-            self.logger.warn("Task '%s' has no request" % task_id)
+            self.logger.warn("Task '%s' has no request" % task['id'])
             return False
         id = data['id']
         request = data['request']
@@ -1251,7 +1391,7 @@ class TaskManager(object):
         else:
             handler = handlerClass(id,method,params)
         # set weight
-        session.host.setTaskWeight(task_id,handler.weight())
+        session.host.setTaskWeight(id,handler.weight())
         if handler.Foreground:
             self.logger.info("running task in foreground")
             handler.setManager(self)
@@ -1462,90 +1602,44 @@ class BaseTaskHandler(object):
     def getUploadDir(self):
         return koji.pathinfo.taskrelpath(self.id)
 
-    def uploadFile(self, filename, remoteName=None):
+    def uploadFile(self, filename, relPath=None, remoteName=None):
         """Upload the file with the given name to the task output directory
         on the hub."""
+        uploadPath = self.getUploadDir()
+        if relPath:
+            relPath = relPath.strip('/')
+            uploadPath += '/' + relPath
         # Only upload files with content
         if os.path.isfile(filename) and os.stat(filename).st_size > 0:
-            session.uploadWrapper(filename, self.getUploadDir(), remoteName)
+            session.uploadWrapper(filename, uploadPath, remoteName)
 
-    def genImageManifest(self, image, manifile):
-        """
-        Using iso9660 from pycdio, get the file manifest of the given image,
-        and save it to the text file manifile.
-        """
-        fd = open(manifile, 'w')
-        if not fd:
-            raise koji.GenericError, \
-                'Unable to open manifest file (%s) for writing!' % manifile
-        iso = iso9660.ISO9660.IFS(source=image)
-        if not iso.is_open():
-            raise koji.GenericError, \
-                'Could not open %s as an ISO-9660 image!' % image
-
-        # image metadata
-        id = iso.get_application_id()
-        if id is not None: fd.write("Application ID: %s\n" % id)
-        id = iso.get_preparer_id()
-        if id is not None: fd.write("Preparer ID: %s\n" % id)
-        id = iso.get_publisher_id()
-        if id is not None: fd.write("Publisher ID: %s\n" % id)
-        id = iso.get_system_id()
-        if id is not None: fd.write("System ID: %s\n" % id)
-        id = iso.get_volume_id()
-        if id is not None: fd.write("Volume ID: %s\n" % id)
-        id = iso.get_volumeset_id()
-        if id is not None: fd.write("Volumeset ID: %s\n" % id)
-
-        fd.write('\nSize(bytes)  File Name\n')
-        manifest = self.listImageDir(iso, '/')
-        for a_file in manifest:
-            fd.write(a_file)
-        fd.close()
-        iso.close()
-
-    def listImageDir(self, iso, path):
-        """
-        Helper function called recursively by getImageManifest. Returns a
-        listing of files/directories at the given path in an iso image obj.
-        """
-        manifest = []
-        file_stats = iso.readdir(path)
-        for stat in file_stats:
-            filename = stat[0]
-            size = stat[2]
-            is_dir = stat[4] == 2
-
-            if filename == '..':
-                continue
-            elif filename == '.':
-                # path should always end in a trailing /
-                filepath = path
+    def uploadTree(self, dirpath, flatten=False):
+        """Upload the directory tree at dirpath to the task directory on the
+        hub, preserving the directory structure"""
+        dirpath = dirpath.rstrip('/')
+        for path, dirs, files in os.walk(dirpath):
+            if flatten:
+                relpath = None
             else:
-                filepath = path + filename
-                # identify directories with a trailing /
-                if is_dir:
-                    filepath += '/'
-
-            if is_dir and filename != '.':
-                # recurse into subdirectories
-                manifest.extend(self.listImageDir(iso, filepath))
-            else:
-                # output information for the current directory and files
-                manifest.append("%-10d   %s\n" % (size, filepath))
-
-        return manifest
+                relpath = path[len(dirpath) + 1:]
+            for filename in files:
+                self.uploadFile(os.path.join(path, filename), relpath)
 
     def localPath(self, relpath):
         """Return a local path to a remote file.
 
         If the file is on an nfs mount, use that, otherwise download a copy"""
         if options.topurl:
+            fn = "%s/local/%s" % (self.workdir, relpath)
+            if os.path.exists(fn):
+                # We've already downloaded this file,
+                # just return the existing local path
+                return fn
             self.logger.debug("Downloading %s", relpath)
             url = "%s/%s" % (options.topurl, relpath)
             fsrc = urllib2.urlopen(url)
-            fn = "%s/local/%s" % (self.workdir, relpath)
-            os.makedirs(os.path.dirname(fn))
+            if not os.path.exists(os.path.dirname(fn)):
+                os.makedirs(os.path.dirname(fn))
             fdst = file(fn, 'w')
             shutil.copyfileobj(fsrc, fdst)
             fsrc.close()
@@ -1732,22 +1826,22 @@ class ChainBuildTask(BaseTaskHandler):
         if not target_info:
             raise koji.GenericError, 'unknown build target: %s' % target
         nvrs = []
-        for n_src, build_level in enumerate(srcs):
+        for n_level, build_level in enumerate(srcs):
             #if there are any nvrs to wait on, do so
             if nvrs:
                 task_id = session.host.subtask(method='waitrepo',
                                                arglist=[target_info['build_tag_name'], None, nvrs],
-                                               label="wait %i" % n_src,
+                                               label="wait %i" % n_level,
                                                parent=self.id)
                 self.wait(task_id, all=True, failany=True)
             nvrs = []
             #kick off the builds for this level
             build_tasks = []
-            for src in build_level:
+            for n_src, src in enumerate(build_level):
                 if SCM.is_scm_url(src):
                     task_id = session.host.subtask(method='build',
                                                    arglist=[src, target, opts],
-                                                   label="build %i" % n_src,
+                                                   label="build %i,%i" % (n_level, n_src),
                                                    parent=self.id)
                     build_tasks.append(task_id)
                 else:
@@ -2164,6 +2258,512 @@ class BuildArchTask(BaseTaskHandler):
 
         return ret
 
+class MavenTask(BaseTaskHandler):
+
+    Methods = ['maven']
+
+    _taskWeight = 0.2
+
+    def handler(self, url, target, opts=None):
+        """Use Maven to build the source from the given url"""
+        if opts is None:
+            opts = {}
+        self.opts = opts
+        target_info = session.getBuildTarget(target)
+        if not target_info:
+            raise koji.BuildError, 'unknown build target: %s' % target
+        dest_tag = session.getTag(target_info['dest_tag'], strict=True)
+        build_tag = session.getTag(target_info['build_tag'], strict=True)
+
+        repo_id = opts.get('repo_id')
+        if not repo_id:
+            repo = session.getRepo(build_tag['id'])
+            if repo:
+                repo_id = repo['id']
+            else:
+                raise koji.BuildError, 'no repo for tag %s' % build_tag['name']
+
+        build_opts = {'repo_id': repo_id}
+        if opts.get('profiles'):
+            build_opts['profiles'] = opts['profiles']
+        if opts.get('properties'):
+            build_opts['properties'] = opts['properties']
+        if opts.get('patches'):
+            build_opts['patches'] = opts['patches']
+        if opts.get('jvm_options'):
+            build_opts['jvm_options'] = opts['jvm_options']
+
+        self.build_task_id = session.host.subtask(method='buildMaven',
+                                                  arglist=[url, build_tag, build_opts],
+                                                  label='build',
+                                                  parent=self.id,
+                                                  arch='noarch')
+        maven_results = self.wait(self.build_task_id)[self.build_task_id]
+        maven_results['task_id'] = self.build_task_id
+
+        build_info = None
+        if not self.opts.get('scratch'):
+            maven_info = maven_results['maven_info']
+            build_info = koji.maven_info_to_nvr(maven_info)
+
+            if not self.opts.get('skip_tag'):
+                dest_cfg = session.getPackageConfig(dest_tag['id'], build_info['name'])
+                # Make sure package is on the list for this tag
+                if dest_cfg is None:
+                    raise koji.BuildError, "package %s not in list for tag %s" \
+                        % (build_info['name'], dest_tag['name'])
+                elif dest_cfg['blocked']:
+                    raise koji.BuildError, "package %s is blocked for tag %s" \
+                        % (build_info['name'], dest_tag['name'])
+
+            self.build_id, build_info = session.host.initMavenBuild(self.id, build_info, maven_info)
+
+        try:
+            rpm_results = None
+            spec_url = self.opts.get('specfile')
+            if spec_url:
+                rpm_results = self.buildWrapperRPM(spec_url, build_tag, build_info, repo_id)
+
+            if not self.opts.get('scratch'):
+                session.host.completeMavenBuild(self.id, self.build_id, maven_results, rpm_results)
+        except (SystemExit, ServerExit, KeyboardInterrupt):
+            # we do not trap these
+            raise
+        except:
+            if not self.opts.get('scratch'):
+                #scratch builds do not get imported
+                session.host.failBuild(self.id, self.build_id)
+            # reraise the exception
+            raise
+
+        if not self.opts.get('scratch') and not self.opts.get('skip_tag'):
+            tag_task_id = session.host.subtask(method='tagBuild',
+                                               arglist=[dest_tag['id'], self.build_id, False, None, True],
+                                               label='tag',
+                                               parent=self.id,
+                                               arch='noarch')
+            self.wait(tag_task_id)
+
+    def buildWrapperRPM(self, spec_url, build_tag, build, repo_id):
+        task = session.getTaskInfo(self.build_task_id)
+        arglist = [spec_url, build_tag, build, task, {'repo_id': repo_id}]
+
+        rpm_task_id = session.host.subtask(method='wrapperRPM',
+                                           arglist=arglist,
+                                           label='rpm',
+                                           parent=self.id,
+                                           arch='noarch')
+        results = self.wait(rpm_task_id)[rpm_task_id]
+        results['task_id'] = rpm_task_id
+
+        return results
+
+class BuildMavenTask(BaseTaskHandler):
+
+    Methods = ['buildMaven']
+
+    _taskWeight = 1.5
+
+    def _zip_dir(self, rootdir, filename):
+        rootbase = os.path.basename(rootdir)
+        roottrim = len(rootdir) - len(rootbase)
+        zfo = zipfile.ZipFile(filename, 'w', zipfile.ZIP_DEFLATED)
+        for dirpath, dirnames, filenames in os.walk(rootdir):
+            for filename in filenames:
+                filepath = os.path.join(dirpath, filename)
+                zfo.write(filepath, filepath[roottrim:])
+        zfo.close()
+
+    def handler(self, url, build_tag, opts=None):
+        if opts is None:
+            opts = {}
+        self.opts = opts
+
+        scm = SCM(url)
+        scm.assert_allowed(options.allowed_scms)
+
+        repo_id = opts.get('repo_id')
+        if not repo_id:
+            raise koji.BuildError, 'A repo_id must be provided'
+        repo_info = session.repoInfo(repo_id, strict=True)
+        event_id = repo_info['create_event']
+
+        br_arch = self.find_arch('noarch', session.host.getHost(), session.getBuildConfig(build_tag['id'], event=event_id))
+        maven_opts = opts.get('jvm_options')
+        if not maven_opts:
+            maven_opts = []
+        for opt in maven_opts:
+            if opt.startswith('-Xmx'):
+                break
+        else:
+            # Give the JVM 2G to work with by default, if the build isn't specifying its own max. memory
+            maven_opts.append('-Xmx2048m')
+        buildroot = BuildRoot(build_tag['id'], br_arch, self.id, install_group='maven-build', setup_dns=True, repo_id=repo_id,
+                              maven_opts=' '.join(maven_opts))
+        self.logger.debug("Initializing buildroot")
+        buildroot.init()
+
+        if not os.path.exists('%s/usr/bin/mvn' % buildroot.rootdir()):
+            raise koji.BuildError, '/usr/bin/mvn was not found in the buildroot'
+
+        scmdir = '%s/maven/build' % buildroot.rootdir()
+        outputdir = '%s/maven/output' % buildroot.rootdir()
+        repodir = '%s/maven/repo' % buildroot.rootdir()
+        patchdir = '%s/maven/patches' % buildroot.rootdir()
+
+        koji.ensuredir(scmdir)
+        koji.ensuredir(outputdir)
+        koji.ensuredir(repodir)
+        koji.ensuredir(patchdir)
+
+        mockuid = None
+        try:
+            if options.mockuser:
+                if options.mockuser.isdigit():
+                    mockuid = pwd.getpwuid(int(options.mockuser)).pw_uid
+                else:
+                    mockuid = pwd.getpwnam(options.mockuser).pw_uid
+        except:
+            self.logger.warn('Could not get uid for mockuser: %s' % options.mockuser)
+
+        logfile = self.workdir + '/checkout.log'
+        uploadpath = self.getUploadDir()
+
+        # Check out sources from the SCM
+        sourcedir = scm.checkout(scmdir, uploadpath, logfile)
+
+        build_pom = os.path.join(sourcedir, 'pom.xml')
+        if not os.path.exists(build_pom):
+            raise koji.BuildError, 'no pom.xml found in checkout'
+        pom_info = koji.parse_pom(build_pom)
+        maven_info = koji.pom_to_maven_info(pom_info)
+        maven_label = koji.mavenLabel(maven_info)
+
+        # zip up pristine sources for auditing purposes
+        task_sources = maven_label + '-sources.zip'
+        self._zip_dir(sourcedir, os.path.join(outputdir, task_sources))
+
+        # Checkout out patches, if present
+        if self.opts.get('patches'):
+            patchlog = self.workdir + '/patches.log'
+            patch_scm = SCM(self.opts.get('patches'))
+            patch_scm.assert_allowed(options.allowed_scms)
+            # never try to check out a common/ dir when checking out patches
+            patch_scm.use_common = False
+            patchcheckoutdir = patch_scm.checkout(patchdir, uploadpath, patchlog)
+            task_patches = maven_label + '-patches.zip'
+            self._zip_dir(patchcheckoutdir, os.path.join(outputdir, task_patches))
+
+        # Set ownership of the entire source tree to the mock user
+        if mockuid != None:
+            cmd = ['/bin/chown', '-R', str(mockuid), scmdir, outputdir, repodir]
+            if self.opts.get('patches'):
+                cmd.append(patchdir)
+            ret = log_output(cmd[0], cmd, logfile, uploadpath, logerror=1, append=1)
+            if ret:
+                raise koji.BuildError, 'error changing ownership of the source, repo, and output directories'
+
+        # Apply patches, if present
+        if self.opts.get('patches'):
+            # filter out directories and files beginning with . (probably scm metadata)
+            patches = [patch for patch in os.listdir(patchcheckoutdir) if \
+                           os.path.isfile(os.path.join(patchcheckoutdir, patch)) and \
+                           not patch.startswith('.')]
+            if not patches:
+                raise koji.BuildError, 'no patches found at %s' % self.opts.get('patches')
+            patches.sort()
+            for patch in patches:
+                cmd = ['/usr/bin/patch', '--verbose', '-d', sourcedir, '-p1', '-i', os.path.join(patchcheckoutdir, patch)]
+                ret = log_output(cmd[0], cmd, patchlog, uploadpath, logerror=1, append=1)
+                if ret:
+                    raise koji.BuildError, 'error applying patches from %s, see patches.log for details' % self.opts.get('patches')
+
+        settingsfile = '/maven/settings.xml'
+        buildroot.writeMavenSettings(repodir, settingsfile)
+
+        buildroot.mavenBuild(sourcedir, outputdir, repodir, settingsfile,
+                             props=self.opts.get('properties'), profiles=self.opts.get('profiles'))
+
+        logs = ['checkout.log']
+        if self.opts.get('patches'):
+            logs.append('patches.log')
+        output_files = {}
+
+        for path, dirs, files in os.walk(outputdir):
+            if not files:
+                continue
+            reldir = path[len(outputdir) + 1:]
+            for filename in files:
+                root, ext = os.path.splitext(filename)
+                if ext == '.log':
+                    logs.append(os.path.join(reldir, filename))
+                elif ext == '.md5' or \
+                        ext == '.sha1' or \
+                        filename == 'maven-metadata.xml':
+                    # metadata, we'll recreate that ourselves
+                    pass
+                else:
+                    output_files.setdefault(reldir, []).append(filename)
+
+        # upload the build output
+        for filepath in logs:
+            self.uploadFile(os.path.join(outputdir, filepath),
+                            relPath=os.path.dirname(filepath))
+        for relpath, files in output_files.iteritems():
+            for filename in files:
+                self.uploadFile(os.path.join(outputdir, relpath, filename),
+                                relPath=relpath)
+
+        # Should only find log files in the mock result directory.
+        # Don't upload these log files, they've already been streamed
+        # the hub.
+        for filename in os.listdir(buildroot.resultdir()):
+            root, ext = os.path.splitext(filename)
+            if ext == '.log':
+                filepath = os.path.join(buildroot.resultdir(), filename)
+                if os.path.isfile(filepath) and os.stat(filepath).st_size > 0:
+                    # only files with content get uploaded to the hub
+                    logs.append(filename)
+            else:
+                raise koji.BuildError, 'unknown file type: %s' % filename
+
+        buildroot.expire()
+
+        return {'maven_info': maven_info,
+                'buildroot_id': buildroot.id,
+                'logs': logs,
+                'files': output_files}
+
+class WrapperRPMTask(BaseTaskHandler):
+    """Build a wrapper rpm around jars output from a Maven build.
+    Can either be called as a subtask of a maven task or as a separate
+    top-level task.  In the latter case it will permanently delete any
+    existing rpms associated with the build and replace them with the
+    newly-built rpms."""
+
+    Methods = ['wrapperRPM']
+
+    _taskWeight = 1.5
+
+    def copy_fields(self, src, tgt, *fields):
+        for field in fields:
+            tgt[field] = src.get(field)
+
+    def spec_sanity_checks(self, filename):
+        spec = open(filename).read()
+        for tag in ("Packager", "Distribution", "Vendor"):
+            if re.match("%s:" % tag, spec, re.M):
+                raise koji.BuildError, "%s is not allowed to be set in spec file" % tag
+        for tag in ("packager", "distribution", "vendor"):
+            if re.match("%%define\s+%s\s+" % tag, spec, re.M):
+                raise koji.BuildError, "%s is not allowed to be defined in spec file" % tag
+
+    def handler(self, spec_url, build_tag, build, task, opts=None):
+        if not opts:
+            opts = {}
+
+        values = {}
+
+        maven_info = None
+
+        # map of file extension to a list of files
+        artifacts = {}
+        # list of all files
+        all_artifacts = []
+        # list of all files with their maven repo path
+        all_artifacts_with_path = []
+
+        # makes generating relative paths easier
+        self.pathinfo = koji.PathInfo(topdir='')
+
+        if task:
+            # called as a subtask of a maven build
+            artifact_paths = session.listTaskOutput(task['id'])
+
+            for artifact_path in artifact_paths:
+                artifact_name = os.path.basename(artifact_path)
+                base, ext = os.path.splitext(artifact_name)
+                if ext == '.log':
+                    # Exclude log files for consistency with the output of listArchives() used below
+                    continue
+                relpath = os.path.join(self.pathinfo.task(task['id']), artifact_path)[1:]
+                artifacts.setdefault(ext, []).append(relpath)
+                all_artifacts.append(artifact_name)
+                all_artifacts_with_path.append(artifact_path)
+        else:
+            # called as a top-level task to create wrapper rpms for an existing build
+            # verify that the build is complete
+            if not build['state'] == koji.BUILD_STATES['COMPLETE']:
+                raise koji.BuildError, 'cannot call wrapperRPM on a build that did not complete successfully'
+
+            maven_info = session.getMavenBuild(build['id'], strict=True)
+
+            # get the list of files from the build instead of the task, because the task output directory may
+            # have already been cleaned up
+            build_artifacts = session.listArchives(buildID=build['id'], type='maven')
+
+            for artifact in build_artifacts:
+                artifact_name = artifact['filename']
+                base, ext = os.path.splitext(artifact_name)
+                if ext == '.log':
+                    # listArchives() should never return .log files, but we check for completeness
+                    continue
+                relpath = os.path.join(self.pathinfo.mavenbuild(build, maven_info), artifact_name)[1:]
+                artifacts.setdefault(ext, []).append(relpath)
+                all_artifacts.append(artifact_name)
+                repopath = os.path.join(self.pathinfo.mavenrepo(maven_info, artifact), artifact_name)[len('/maven2/'):]
+                all_artifacts_with_path.append(repopath)
+
+        if not artifacts:
+            raise koji.BuildError, 'no output found for %s' % (task and koji.taskLabel(task) or koji.buildLabel(build))
+
+        artifacts_base = {}
+        # construct a map of just basenames to pass to the template
+        for key, vals in artifacts.items():
+            # sort the lists while we're at it
+            vals.sort()
+            artifacts_base[key] = [os.path.basename(val) for val in vals]
+
+        values['artifacts'] = artifacts_base
+        values['all_artifacts'] = all_artifacts
+        values['all_artifacts_with_path'] = all_artifacts_with_path
+
+        if build:
+            self.copy_fields(build, values, 'epoch', 'name', 'version', 'release')
+            if not maven_info:
+                maven_info = session.getMavenBuild(build['id'], strict=True)
+            values['maven_info'] = maven_info
+        else:
+            # Get the pom info from the first pom and convert it to build format
+            # so we can use it as substitution variables in the template.
+            # If there are no poms, populate the values dict with empty placeholders.  If the spec file 
+            # doesn't require these variables, it should work.  If it does, then the rpmbuild will 
+            # likely fail.
+            poms = artifacts.get('.pom', [])
+            if poms:
+                pom_path = self.localPath(poms[0])
+                pom_info = koji.parse_pom(pom_path)
+                maven_info = koji.pom_to_maven_info(pom_info)
+                maven_nvr = koji.maven_info_to_nvr(maven_info)
+                maven_nvr['release'] = '0.scratch'
+                self.copy_fields(maven_nvr, values, 'epoch', 'name', 'version', 'release')
+                values['maven_info'] = maven_info
+            else:
+                values.update({'epoch': None, 'name': '', 'version': '', 'release': ''})
+                values['maven_info'] = {'group_id': '', 'artifact_id': '', 'version': ''}
+
+        scm = SCM(spec_url)
+        scm.assert_allowed(options.allowed_scms)
+
+        repo_id = opts.get('repo_id')
+        if not repo_id:
+            raise koji.BuildError, "A repo id must be provided"
+
+        repo_info = session.repoInfo(repo_id, strict=True)
+        event_id = repo_info['create_event']
+        br_arch = self.find_arch('noarch', session.host.getHost(), session.getBuildConfig(build_tag['id'], event=event_id))
+
+        buildroot = BuildRoot(build_tag['id'], br_arch, self.id, install_group='wrapper-rpm-build', repo_id=repo_id)
+        self.logger.debug("Initializing buildroot")
+        buildroot.init()
+
+        logfile = os.path.join(self.workdir, 'checkout.log')
+        scmdir = buildroot.rootdir() + '/tmp/scmroot'
+        koji.ensuredir(scmdir)
+        specdir = scm.checkout(scmdir, self.getUploadDir(), logfile)
+
+        spec_template = None
+        for path, dir, files in os.walk(specdir):
+            files.sort()
+            for filename in files:
+                if filename.endswith('.spec.tmpl'):
+                    spec_template = os.path.join(path, filename)
+                    break
+        if not spec_template:
+            raise koji.BuildError, 'no spec file template found at URL: %s' % spec_url
+
+        # Put the jars into the same directory as the specfile.  This directory will be
+        # set to the rpm _sourcedir so other files in the SCM may be referenced in the
+        # specfile as well.
+        specdir = os.path.dirname(spec_template)
+        for key, filepaths in artifacts.items():
+            for filepath in filepaths:
+                localpath = self.localPath(filepath)
+                shutil.copy(localpath, specdir)
+
+        contents = Cheetah.Template.Template(file=spec_template,
+                                             searchList=[values]).respond()
+
+        specfile = spec_template[:-5]
+        specfd = file(specfile, 'w')
+        specfd.write(contents)
+        specfd.close()
+
+        # Run spec file sanity checks.  Any failures will throw a BuildError
+        self.spec_sanity_checks(specfile)
+
+        #build srpm
+        self.logger.debug("Running srpm build")
+        buildroot.build_srpm(specfile, specdir, None)
+
+        srpms = glob.glob('%s/*.src.rpm' % buildroot.resultdir())
+        if len(srpms) == 0:
+            raise koji.BuildError, 'no srpms found in %s' % outputdir
+        elif len(srpms) > 1:
+            raise koji.BuildError, 'multiple srpms found in %s: %s' % (outputdir, ', '.join(srpms))
+        else:
+            srpm = srpms[0]
+
+        shutil.move(srpm, self.workdir)
+        srpm = os.path.join(self.workdir, os.path.basename(srpm))
+
+        buildroot.build(srpm)
+
+        resultdir = buildroot.resultdir()
+        srpm = None
+        rpms = []
+        logs = ['checkout.log']
+
+        for filename in os.listdir(resultdir):
+            if filename.endswith('.src.rpm'):
+                if not srpm:
+                    srpm = filename
+                else:
+                    raise koji.BuildError, 'multiple srpms found in %s: %s, %s' % \
+                        (resultdir, srpm, filename)
+            elif filename.endswith('.rpm'):
+                rpms.append(filename)
+            elif filename.endswith('.log'):
+                logs.append(filename)
+            else:
+                raise koji.BuildError, 'unexpected file found in %s: %s' % \
+                    (resultdir, filename)
+
+        if not srpm:
+            raise koji.BuildError, 'no srpm found'
+
+        if not rpms:
+            raise koji.BuildError, 'no rpms found'
+
+        for rpm in [srpm] + rpms:
+            self.uploadFile(os.path.join(resultdir, rpm))
+
+        results = {'buildroot_id': buildroot.id,
+                   'srpm': srpm,
+                   'rpms': rpms,
+                   'logs': logs}
+
+        if not task and not opts.get('scratch'):
+            # Called as a standalone top-level task, so import the rpms now.
+            # Otherwise we let the parent task handle it.
+            session.host.importWrapperRPMs(self.id, build['id'], results)
+
+        # no need to upload logs, they've already been streamed to the hub
+        # during the build process
+
+        buildroot.expire()
+
+        return results
 
 class TagBuildTask(BaseTaskHandler):
 
@@ -2189,145 +2789,41 @@ class TagBuildTask(BaseTaskHandler):
             session.host.tagNotification(False, tag_id, fromtag, build_id, user_id, ignore_success, "%s: %s" % (exctype, value))
             raise e
 
-# LiveCDTask begins with a mock chroot, and then installs livecd-tools into it
-# via the livecd-build group. livecd-creator is then executed in the chroot
-# to create the LiveCD image.
-#
-class LiveCDTask(BaseTaskHandler):
+# A generic task for building cd or disk images. Other handlers should inherit
+# this.
+class ImageTask(BaseTaskHandler):
+    Methods = []
 
-    Methods = ['createLiveCD']
-    _taskWeight = 1.5
+    def makeImgBuildRoot(self, buildtag, repoinfo, arch, inst_group):
+        """
+        Create and prepare the chroot we're going to build an image in. 
+        Binds necessary directories and creates needed device files.
 
-    def handler(self, arch, target, ksfile, opts=None):
-        if not opts:
-            opts = {}
-
-        if not livecd_enabled:
-            self.logger.error("LiveCD features require the following dependencies: "
-                    "pykickstart, pycdio, and possibly python-hashlib")
-            raise koji.LiveCDError, 'LiveCD functions not available'
-
-        global options
-        target_info = session.getBuildTarget(target, strict=True)
-        build_tag = target_info['build_tag']
-        repo_info = session.getRepo(build_tag)
+        @args:
+            buildtag: a build tag
+            repoinfo: a session.getRepo() object
+            arch: a canonical architecture name
+            inst_group: a string representing the yum group to install with
+        @returns: a buildroot object
+        """
 
         # Here we configure mock to bind mount a set of /dev directories
-        # so livecd-creator can use them.
-        # We use mknod to create the loopN device files later, but if we
-        # wanted to have mock do that work, our bind_opts variable would have
-        # this additional dictionary:
-        #	{ 'files' : {
-        #		'/dev/loop0' : '/dev/loop0',
-        #		'/dev/loop1' : '/dev/loop1',
-        #		'/dev/loop2' : '/dev/loop2',
-        #		'/dev/loop3' : '/dev/loop3',
-        #		'/dev/loop4' : '/dev/loop4',
-        #		'/dev/loop5' : '/dev/loop5',
-        #		'/dev/loop6' : '/dev/loop6',
-        #		'/dev/loop7' : '/dev/loop7'}}
         bind_opts = {'dirs' : {
                          '/dev/pts' : '/dev/pts',
                          '/dev/shm' : '/dev/shm',
                          '/dev/mapper' : '/dev/mapper',
                          '/selinux' : '/selinux'}
                     }
-        rootopts = {'install_group': 'livecd-build',
+        rootopts = {'install_group': inst_group,
                     'setup_dns': True,
-                    'repo_id': repo_info['id'],
+                    'repo_id': repoinfo['id'],
                     'bind_opts' : bind_opts}
 
-        broot = BuildRoot(build_tag, arch, self.id, **rootopts)
+        broot = BuildRoot(buildtag, arch, self.id, **rootopts)
 
         # create the mock chroot
-        self.logger.debug("Initializing buildroot")
+        self.logger.debug("Initializing image buildroot")
         broot.init()
-
-        # Note that if the KS file existed locally, then "ksfile" is a relative
-        # path to it in the /mnt/koji/work directory. If not, then it is still
-        # the parameter the user passed in initially, and we assume it is a
-        # relative path in a remote scm. The user should have passed in an scm
-        # url with --ksurl.
-        tmpchroot = '/tmp'
-        scmdir = os.path.join(broot.rootdir(), tmpchroot[1:])
-        koji.ensuredir(scmdir)
-        self.logger.debug("ksfile = %s" % ksfile)
-        if opts.get('ksurl'):
-            scm = SCM(opts['ksurl'])
-            scm.assert_allowed(options.allowed_scms)
-            logfile = os.path.join(self.workdir, 'checkout.log')
-            scmsrcdir = scm.checkout(scmdir, self.getUploadDir(), logfile)
-            kspath = os.path.join(scmsrcdir, ksfile)
-        else:
-            kspath = self.localPath("work/%s" % ksfile)
-
-        # XXX: If the ks file came from a local path and has %include
-        #      macros, livecd-creator will fail because the included
-        #      kickstarts were not copied into the chroot. For now we
-        #      require users to flatten their kickstart file if submitting
-        #      the task with a local path.
-        #
-        #      Note that if an SCM URL was used instead, %include macros
-        #      may not be a problem if the included kickstarts are present
-        #      in the repository we checked out.
-
-        # Now we do some kickstart manipulation. If the user passed in a repo
-        # url with --repo, then we substitute that in for the repo(s) specified
-        # in the kickstart file. If --repo wasn't specified, then we use the
-        # repo associated with the target passed in initially.
-        self.uploadFile(kspath) # upload the original ks file
-        if opts.get('ksversion'):
-            version = ksparser.makeVersion(ksparser.stringToVersion(opts['ksversion']))
-        else:
-            version = ksparser.makeVersion()
-        ks = ksparser.KickstartParser(version)
-        repo_class = kscontrol.dataMap[ks.version]['RepoData']
-
-        try:
-            ks.readKickstart(kspath)
-        except IOError, (err, msg):
-            raise koji.LiveCDError("Failed to read kickstart file "
-                                   "'%s' : %s" % (ksfile, msg))
-        except kserrors.KickstartError, e:
-            raise koji.LiveCDError("Failed to parse kickstart file "
-                                    "'%s' : %s" % (ksfile, e))
-
-        ks.handler.repo.repoList = [] # delete whatever the ks file told us
-        if opts.get('repo'):
-            user_repos = opts['repo'].split(',')
-            index = 0
-            for user_repo in user_repos:
-                ks.handler.repo.repoList.append(repo_class(baseurl=user_repo,
-                                                           name='koji-override-%i' % index))
-                index += 1
-        else:
-            topurl = getattr(options, 'topurl')
-            if not topurl:
-                raise koji.LiveCDError, 'topurl must be defined in kojid.conf'
-            path_info = koji.PathInfo(topdir=topurl)
-            repopath = path_info.repo(repo_info['id'],
-                                      target_info['build_tag_name'])
-            baseurl = '%s/%s' % (repopath, arch)
-            self.logger.debug('BASEURL: %s' % baseurl)
-            ks.handler.repo.repoList.append(repo_class(baseurl=baseurl,
-                                                       name='koji-%s-%i' % (target_info['build_tag_name'],
-                                                                            repo_info['id'])))
-
-        # Write out the new ks file. Note that things may not be in the same
-        # order and comments in the original ks file may be lost.
-        kskoji = os.path.join(tmpchroot, 'koji-livecd-%s-%i.ks' % (target_info['build_tag_name'], self.id))
-        kspath = os.path.join(broot.rootdir(), kskoji[1:])
-        outfile = open(kspath, 'w')
-        outfile.write(str(ks.handler))
-        outfile.close()
-
-        # put the new ksfile in the output directory
-        if not os.path.exists(kspath):
-            raise koji.LiveCDError, "KS file missing: %s" % kspath
-        self.uploadFile(kspath)
-
-        cachedir = os.path.join(tmpchroot, 'koji-livecd')   # arbitrary
-        livecd_log = os.path.join(tmpchroot, 'livecd.log')  # path in chroot
 
         # Create the loopback devices we need
         cmd = 'for i in $(seq 0 7); do mknod /dev/loop$i b 7 $i; done'
@@ -2345,8 +2841,373 @@ class LiveCDTask(BaseTaskHandler):
             raise koji.LiveCDError, \
                 "Could not create /dev/urandom: %s" % _parseStatus(rv, '"%s"' % cmd)
 
-        # Run livecd-creator
+        self.logger.debug("Image buildroot ready: " + broot.rootdir())
+        return broot
+
+    def fetchKickstart(self, broot, ksfile):
+        """
+        Retrieve the kickstart file we were given (locally or remotely) and 
+        upload it.
+
+        Note that if the KS file existed locally, then "ksfile" is a relative
+        path to it in the /mnt/koji/work directory. If not, then it is still
+        the parameter the user passed in initially, and we assume it is a
+        relative path in a remote scm. The user should have passed in an scm
+        url with --ksurl.
+
+        @args:
+            broot: a buildroot object
+            ksfile: path to a kickstart file
+        @returns: absolute path to the retrieved kickstart file
+        """
+        scmdir = os.path.join(broot.rootdir(), 'tmp')
+        koji.ensuredir(scmdir)
+        self.logger.debug("ksfile = %s" % ksfile)
+        if self.opts.get('ksurl'):
+            scm = SCM(self.opts['ksurl'])
+            scm.assert_allowed(options.allowed_scms)
+            logfile = os.path.join(self.workdir, 'checkout.log')
+            scmsrcdir = scm.checkout(scmdir, self.getUploadDir(), logfile)
+            kspath = os.path.join(scmsrcdir, ksfile)
+        else:
+            kspath = self.localPath("work/%s" % ksfile)
+
+        self.uploadFile(kspath) # upload the original ks file
+        return kspath # full absolute path to the file in the chroot
+
+    def prepareKickstart(self, repo_info, target_info, arch, broot, kspath):
+        """
+        Process the ks file to be used for controlled image generation. This
+        method also uploads the modified kickstart file to the task output
+        area.
+
+        @args:
+            target_info: a sesion.getBuildTarget() object
+            repo_info: session.getRepo() object
+            arch: canonical architecture name
+            broot: a buildroot object
+            kspath: absolute path to a kickstart file
+        @returns:
+            absolute path to a processed kickstart file within the buildroot
+        """
+        # XXX: If the ks file came from a local path and has %include
+        #      macros, *-creator will fail because the included
+        #      kickstarts were not copied into the chroot. For now we
+        #      require users to flatten their kickstart file if submitting
+        #      the task with a local path.
+        #
+        #      Note that if an SCM URL was used instead, %include macros
+        #      may not be a problem if the included kickstarts are present
+        #      in the repository we checked out.
+
+        # Now we do some kickstart manipulation. If the user passed in a repo
+        # url with --repo, then we substitute that in for the repo(s) specified
+        # in the kickstart file. If --repo wasn't specified, then we use the
+        # repo associated with the target passed in initially.
+        if self.opts.get('ksversion'):
+            version = ksparser.makeVersion(ksparser.stringToVersion(self.opts['ksversion']))
+        else:
+            version = ksparser.makeVersion()
+        ks = ksparser.KickstartParser(version)
+        repo_class = kscontrol.dataMap[ks.version]['RepoData']
+
+        try:
+            ks.readKickstart(kspath)
+        except IOError, e:
+            raise koji.LiveCDError("Failed to read kickstart file "
+                                   "'%s' : %s" % (kspath, e))
+        except kserrors.KickstartError, e:
+            raise koji.LiveCDError("Failed to parse kickstart file "
+                                    "'%s' : %s" % (kspath, e))
+
+        ks.handler.repo.repoList = [] # delete whatever the ks file told us
+        if self.opts.get('repo'):
+            user_repos = self.opts['repo'].split(',')
+            index = 0
+            for user_repo in user_repos:
+                ks.handler.repo.repoList.append(repo_class(baseurl=user_repo, name='koji-override-%i' % index))
+                index += 1
+        else:
+            topurl = getattr(options, 'topurl')
+            if not topurl:
+                raise koji.LiveCDError, 'topurl must be defined in kojid.conf'
+            path_info = koji.PathInfo(topdir=topurl)
+            repopath = path_info.repo(repo_info['id'],
+                                      target_info['build_tag_name'])
+            baseurl = '%s/%s' % (repopath, arch)
+            self.logger.debug('BASEURL: %s' % baseurl)
+            ks.handler.repo.repoList.append(repo_class(baseurl=baseurl, name='koji-%s-%i' % (target_info['build_tag_name'], repo_info['id'])))
+
+        # Write out the new ks file. Note that things may not be in the same
+        # order and comments in the original ks file may be lost.
+        kskoji = os.path.join('/tmp', 'koji-image-%s-%i.ks' % 
+                              (target_info['build_tag_name'], self.id))
+        kojikspath = os.path.join(broot.rootdir(), kskoji[1:])
+        outfile = open(kojikspath, 'w')
+        outfile.write(str(ks.handler))
+        outfile.close()
+
+        # put the new ksfile in the output directory
+        if not os.path.exists(kojikspath):
+            raise koji.LiveCDError, "KS file missing: %s" % kojikspath
+        self.uploadFile(kojikspath)
+        return kskoji # absolute path within chroot
+
+    def getImagePackages(self, cachepath):
+        """
+        Read RPM header information from the yum cache available in the 
+        given path. Returns a list of dictionaries for each RPM included.
+        """
+        repos = os.listdir(os.path.join(cachepath))
+        if len(repos) == 0:
+            raise koji.LiveCDError, 'No repos found in yum cache!'
+        hdrlist = []
+        fields = ['name', 'version', 'release', 'epoch', 'arch', \
+                  'buildtime', 'sigmd5']
+        for repo in repos:
+            pkgpath = os.path.join(cachepath, repo, 'packages')
+            pkgs = os.listdir(pkgpath)
+            for pkg in pkgs:
+                pkgfile = os.path.join(pkgpath, pkg)
+                hdr = koji.get_header_fields(pkgfile, fields)
+                hdr['size'] = os.path.getsize(pkgfile)
+                hdr['payloadhash'] = koji.hex_string(hdr['sigmd5'])
+                del hdr['sigmd5']
+                hdrlist.append(hdr)
+        return hdrlist
+
+    def getImageHash(self, img_path):
+        """return a sha256 hash of the given image file"""
+        sha256sum = hashlib.sha256()
+        image_fo = file(img_path, 'r')
+        while True:
+            data = image_fo.read(1048576)
+            sha256sum.update(data)
+            if not len(data):
+                break
+        hash = sha256sum.hexdigest()
+        self.logger.debug('digest: %s' % hash)
+        return hash
+
+# ApplianceTask begins with a mock chroot, and then installs appliance-tools 
+# into it via the appliance-build group. appliance-creator is then executed 
+# in the chroot to create the appliance image.
+#
+class ApplianceTask(ImageTask):
+
+    Methods = ['createAppliance']
+    _taskWeight = 1.5
+
+    def handler(self, arch, target, ksfile, opts=None):
+
+        img_type = {'raw': 'Raw Appliance',
+                    'qcow': 'QCOW Image',
+                    'qcow2': 'QCOW2 Image',
+                    'vmx': 'VMWare Image'}
+
+        target_info = session.getBuildTarget(target, strict=True)
+        build_tag = target_info['build_tag']
+        repo_info = session.getRepo(build_tag)
+
+        if not opts:
+            opts = {}
+        self.opts = opts
+
+        if not image_enabled:
+            self.logger.error("Appliance features require the following dependencies: pykickstart, and possibly python-hashlib")
+            raise koji.ApplianceError, 'Appliance functions not available'
+
+        broot = self.makeImgBuildRoot(build_tag, repo_info, arch, 
+                                      'appliance-build')
+        kspath = self.fetchKickstart(broot, ksfile)
+        kskoji = self.prepareKickstart(repo_info, target_info, arch, broot, 
+                                       kspath)
+
+        # Figure out appliance-creator arguments, we let it fail if something
+        # is wrong.
+        odir = 'app-output'
+        opath = os.path.join(broot.rootdir(), 'tmp', odir)
+        cachedir = '/tmp/koji-appliance'   # arbitrary paths in chroot
+        app_log = '/tmp/appliance.log'
+        os.mkdir(opath)
+
+        cmd = ['/usr/bin/appliance-creator', '-c', kskoji, '-d', '-v', 
+               '--logfile', app_log, '--cache', cachedir, '-o', odir]
+        for arg_name in ('version', 'name', 'release', 'vmem', 'vcpu', 'format'):
+            arg = self.opts.get(arg_name)
+            if arg != None: 
+                cmd.extend(['--%s' % arg_name, arg])
+
+        # Run appliance-creator
+        rv = broot.mock(['--cwd', '/tmp', '--chroot', '--'] + cmd)
+        self.uploadFile(os.path.join(broot.rootdir(), app_log[1:]))
+        if rv:
+            raise koji.ApplianceError, \
+                "Could not create appliance: %s" % _parseStatus(rv, 'appliance-creator') + "; see root.log or appliance.log for more information"
+
+        # Find the results
+        results = []
+        for directory, subdirs, files in os.walk(opath):
+            for f in files:
+                results.append(os.path.join(broot.rootdir(), 'tmp', 
+                                            directory, f))
+        self.logger.debug('output: %s' % results)
+        # TODO: allow for multiple disk images to be generated
+        if len(results) > 2:
+            raise koji.ApplianceError, \
+                "Only one disk image allowed for output! found: %s" % results
+
+        app_path = None
+        for ofile in results:
+            if ofile.endswith('.xml'):
+                self.uploadFile(ofile)
+            else:
+                app_path = ofile
+        if app_path == None:
+            raise kojiApplianceError, "Could not find appliance image!"
+        app_file = os.path.basename(app_path)
+
+        try:
+            filesize = os.path.getsize(app_path)
+        except OSError:
+            raise koji.LiveCDError, 'Could not get appliance file size'
+
+        # if filesize is greater than a 32-bit signed integer's range,
+        # the python XMLRPC module will break.
+        filesize = str(filesize)
+
+        # TODO: get file manifest from the appliance
+
+        # Import info about the image into the database, unless 
+        # this is a scratch image.
+        if not self.opts.get('scratch'):
+            hdrlist = self.getImagePackages(
+                os.path.join(broot.rootdir(), cachedir[1:]))
+            hash = self.getImageHash(app_path)
+            broot.markExternalRPMs(hdrlist)
+            itype = img_type[self.opts.get('format')]
+            self.uploadFile(app_path)
+            image_id = session.host.importImage(self.id, app_file, filesize, 
+                arch, itype, hash, hdrlist) # xml file automatically moved too
+        else:
+            self.uploadFile(app_path)
+
+        broot.expire()
+        if opts.get('scratch'):
+            return 'Scratch appliance image created: %s' % \
+                   os.path.join(koji.pathinfo.work(),
+                                koji.pathinfo.taskrelpath(self.id), app_file)
+        else:
+            return 'Created appliance image: %s' % \
+                   os.path.join(koji.pathinfo.imageFinalPath(),
+                                koji.pathinfo.applianceRelPath(image_id), 
+                                app_file)
+
+# LiveCDTask begins with a mock chroot, and then installs livecd-tools into it
+# via the livecd-build group. livecd-creator is then executed in the chroot
+# to create the LiveCD image.
+#
+class LiveCDTask(ImageTask):
+
+    Methods = ['createLiveCD']
+    _taskWeight = 1.5
+
+    def genISOManifest(self, image, manifile):
+        """
+        Using iso9660 from pycdio, get the file manifest of the given image,
+        and save it to the text file manifile.
+        """
+        fd = open(manifile, 'w')
+        if not fd:
+            raise koji.GenericError, \
+                'Unable to open manifest file (%s) for writing!' % manifile
+        iso = iso9660.ISO9660.IFS(source=image)
+        if not iso.is_open():
+            raise koji.GenericError, \
+                'Could not open %s as an ISO-9660 image!' % image
+
+        # image metadata
+        id = iso.get_application_id()
+        if id is not None: fd.write("Application ID: %s\n" % id)
+        id = iso.get_preparer_id()
+        if id is not None: fd.write("Preparer ID: %s\n" % id)
+        id = iso.get_publisher_id()
+        if id is not None: fd.write("Publisher ID: %s\n" % id)
+        id = iso.get_system_id()
+        if id is not None: fd.write("System ID: %s\n" % id)
+        id = iso.get_volume_id()
+        if id is not None: fd.write("Volume ID: %s\n" % id)
+        id = iso.get_volumeset_id()
+        if id is not None: fd.write("Volumeset ID: %s\n" % id)
+
+        fd.write('\nSize(bytes)  File Name\n')
+        manifest = self.listISODir(iso, '/')
+        for a_file in manifest:
+            fd.write(a_file)
+        fd.close()
+        iso.close()
+
+    def listISODir(self, iso, path):
+        """
+        Helper function called recursively by genISOManifest. Returns a
+        listing of files/directories at the given path in an iso image obj.
+        """
+        manifest = []
+        file_stats = iso.readdir(path)
+        for stat in file_stats:
+            filename = stat[0]
+            size = stat[2]
+            is_dir = stat[4] == 2
+
+            if filename == '..':
+                continue
+            elif filename == '.':
+                # path should always end in a trailing /
+                filepath = path
+            else:
+                filepath = path + filename
+                # identify directories with a trailing /
+                if is_dir:
+                    filepath += '/'
+
+            if is_dir and filename != '.':
+                # recurse into subdirectories
+                manifest.extend(self.listISODir(iso, filepath))
+            else:
+                # output information for the current directory and files
+                manifest.append("%-10d   %s\n" % (size, filepath))
+
+        return manifest
+
+    def handler(self, arch, target, ksfile, opts=None):
+
+        target_info = session.getBuildTarget(target, strict=True)
+        build_tag = target_info['build_tag']
+        repo_info = session.getRepo(build_tag)
+
+        if not opts:
+            opts = {}
+        self.opts = opts
+
+        if not image_enabled:
+            self.logger.error("LiveCD features require the following dependencies: "
+                    "pykickstart, pycdio, and possibly python-hashlib")
+            raise koji.LiveCDError, 'LiveCD functions not available'
+
+        broot = self.makeImgBuildRoot(build_tag, repo_info, arch, 'livecd-build')
+        kspath = self.fetchKickstart(broot, ksfile)
+        kskoji = self.prepareKickstart(repo_info, target_info, arch, broot, kspath)
+
+        cachedir = '/tmp/koji-livecd'   # arbitrary paths in chroot
+        livecd_log = '/tmp/livecd.log'
         cmd = ['/usr/bin/livecd-creator', '-c', kskoji, '-d', '-v', '--logfile', livecd_log, '--cache', cachedir]
+        # we set the fs label to the same as the isoname if it exists, 
+        # taking at most 32 characters
+        name_opt = self.opts.get('isoname')
+        if name_opt:
+            cmd.extend(('-f', name_opt[:32]))
+
+        # Run livecd-creator
         rv = broot.mock(['--cwd', '/tmp', '--chroot', '--'] + cmd)
         self.uploadFile(os.path.join(broot.rootdir(), livecd_log[1:]))
         if rv:
@@ -2383,53 +3244,21 @@ class LiveCDTask(BaseTaskHandler):
         # copy the iso out of the chroot. If we were given an isoname, this is
         # where the renaming happens.
         self.logger.debug('uploading image: %s' % isosrc)
-        if opts.get('isoname'):
-            isofile = opts['isoname']
+        if name_opt:
+            isofile = name_opt
             if not isofile.endswith('.iso'):
                 isofile += '.iso'
         self.uploadFile(isosrc, remoteName=isofile)
 
         # Generate the file manifest of the image
         manifest = os.path.join(broot.resultdir(), 'manifest.log')
-        self.genImageManifest(isosrc, manifest)
+        self.genISOManifest(isosrc, manifest)
         self.uploadFile(manifest)
 
-        if not opts.get('scratch'):
-            # Read the rpm header information from the yum cache livecd-creator
-            # used. We assume it was empty to start.
-            #
-            # LiveCD creator would have thrown an error if no repo was
-            # specified, so we assume the ones we parse are ok.
-            repos = os.listdir(os.path.join(broot.rootdir(), cachedir[1:]))
-            if len(repos) == 0:
-                raise koji.LiveCDError, 'No repos found in yum cache!'
+        if not self.opts.get('scratch'):
 
-            hdrlist = []
-            fields = ['name', 'version', 'release', 'epoch', 'arch', \
-                      'buildtime', 'sigmd5']
-            for repo in repos:
-                pkgpath = os.path.join(broot.rootdir(), cachedir[1:], repo,
-                                       'packages')
-                pkgs = os.listdir(pkgpath)
-                for pkg in pkgs:
-                    pkgfile = os.path.join(pkgpath, pkg)
-                    hdr = koji.get_header_fields(pkgfile, fields)
-                    hdr['size'] = os.path.getsize(pkgfile)
-                    hdr['payloadhash'] = koji.hex_string(hdr['sigmd5'])
-                    del hdr['sigmd5']
-                    hdrlist.append(hdr)
-
-            # get a unique hash of the image file
-            sha256sum = hashlib.sha256()
-            image_fo = file(isosrc, 'r')
-            while True:
-                data = image_fo.read(1048576)
-                sha256sum.update(data)
-                if not len(data):
-                    break
-
-            hash = sha256sum.hexdigest()
-            self.logger.debug('digest: %s' % hash)
+            hdrlist = self.getImagePackages(os.path.join(broot.rootdir(), cachedir[1:]))
+            hash = self.getImageHash(isosrc)
 
             # Import info about the image into the database, unless this is a
             # scratch image.
@@ -2523,7 +3352,7 @@ class BuildSRPMFromSCMTask(BaseTaskHandler):
 
         #build srpm
         self.logger.debug("Running srpm build")
-        broot.build_srpm(spec_file, sourcedir)
+        broot.build_srpm(spec_file, sourcedir, scm.source_cmd)
 
         srpms = glob.glob('%s/*.src.rpm' % broot.resultdir())
         if len(srpms) == 0:
@@ -3093,6 +3922,7 @@ class SCM(object):
         - module
         - revision
         - use_common (defaults to True, may be set by assert_allowed())
+        - source_cmd (defaults to ['make', 'sources'], may be set by assert_allowed())
         - scmtype
 
         The exact format of each attribute is SCM-specific, but the structure of the url
@@ -3113,6 +3943,7 @@ class SCM(object):
         self.module = query
         self.revision = fragment
         self.use_common = True
+        self.source_cmd = ['make', 'sources']
 
         for scmtype, schemes in SCM.types.items():
             if self.scheme in schemes:
@@ -3169,22 +4000,33 @@ class SCM(object):
         Verify that the host and repository of this SCM is in the provided list of
         allowed repositories.
 
-        allowed is a space-separated list of host:repository[:use_common] tuples.  Incorrectly-formatted
+        allowed is a space-separated list of host:repository[:use_common[:source_cmd]] tuples.  Incorrectly-formatted
         tuples will be ignored.
 
         If use_common is not present, kojid will attempt to checkout a common/ directory from the
         repository.  If use_common is set to no, off, false, or 0, it will not attempt to checkout a common/
         directory.
+
+        source_cmd is a shell command (args separated with commas instead of spaces) to run before building the srpm.
+        It is generally used to retrieve source files from a remote location.  If no source_cmd is specified,
+        "make sources" is run by default.
         """
         for allowed_scm in allowed.split():
             scm_tuple = allowed_scm.split(':')
-            if len(scm_tuple) in (2, 3):
+            if len(scm_tuple) >= 2:
                 if fnmatch(self.host, scm_tuple[0]) and fnmatch(self.repository, scm_tuple[1]):
                     # SCM host:repository is in the allowed list
                     # check if we specify a value for use_common
-                    if len(scm_tuple) == 3:
+                    if len(scm_tuple) >= 3:
                         if scm_tuple[2].lower() in ('no', 'off', 'false', '0'):
                             self.use_common = False
+                    # check if we specify a custom source_cmd
+                    if len(scm_tuple) >= 4:
+                        if scm_tuple[3]:
+                            self.source_cmd = scm_tuple[3].split(',')
+                        else:
+                            # there was nothing after the trailing :, so they don't want to run a source_cmd at all
+                            self.source_cmd = None
                     break
             else:
                 self.logger.warn('Ignoring incorrectly formatted SCM host:repository: %s' % allowed_scm)

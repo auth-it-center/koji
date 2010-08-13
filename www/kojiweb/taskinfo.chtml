@@ -4,10 +4,14 @@
 #import cgi
 
 #def printValue($key, $value, $sep=', ')
-  #if $key == 'brootid'
+  #if $key in ('brootid', 'buildroot_id')
 <a href="buildrootinfo?buildrootID=$value">$value</a>
-  #else
-#if $isinstance($value, list) then $sep.join([$str($val) for $val in $value]) else $value#
+  #elif $isinstance($value, list) 
+$sep.join([$str($val) for $val in $value]) 
+  #elif $isinstance($value, dict)
+$sep.join(['%s=%s' % (($n == '' and "''" or $n), $v) for $n, $v in $value.items()])
+  #else 
+$value
   #end if
 #end def
 
@@ -116,7 +120,29 @@
         <strong>Source:</strong> $params[0]<br/>
         <strong>Build Target:</strong> <a href="buildtargetinfo?name=$params[1]">$params[1]</a><br/>
         $printOpts($params[2])
-        #elif $task.method == 'createLiveCD'
+        #elif $task.method == 'maven'
+        <strong>SCM URL:</strong> $params[0]<br/>
+        <strong>Build Target:</strong> <a href="buildtargetinfo?name=$params[1]">$params[1]</a><br/>
+        $printOpts($params[2])
+	#elif $task.method == 'buildMaven'
+	<strong>SCM URL:</strong> $params[0]<br/>
+	<strong>Build Tag:</strong> <a href="taginfo?tagID=$buildTag.id">$buildTag.name</a><br/>
+	#if $len($params) > 2
+        $printOpts($params[2])
+        #end if
+	#elif $task.method == 'wrapperRPM'
+	<strong>Spec File URL:</strong> $params[0]<br/>
+	<strong>Build Tag:</strong> <a href="taginfo?tagID=$buildTag.id">$buildTag.name</a><br/>
+	#if $params[2]
+	<strong>Build:</strong> <a href="buildinfo?buildID=$params[2].id">$koji.buildLabel($params[2])</a><br/>
+	#end if
+	#if $params[3]
+	<strong>Task:</strong> <a href="taskinfo?taskID=$wrapTask.id">$koji.taskLabel($wrapTask)</a><br/>
+	#end if
+        #if $len($params) > 4
+        $printOpts($params[4])
+        #end if
+        #elif $task.method == 'createLiveCD' or $task.method == 'createAppliance'
         <strong>Arch:</strong> $params[0]<br/>
         <strong>Target:</strong> <a href="buildtargetinfo?name=$params[1]">$params[1]</a><br/>
         <strong>Kickstart File:</strong> $params[2]<br/>
@@ -199,6 +225,10 @@
     <tr>
       <th>Created</th><td>$util.formatTimeLong($task.create_time)</td>
     </tr>
+    #if $task.start_time
+    <tr>
+      <th>Started</th><td>$util.formatTimeLong($task.start_time)</td>
+    #end if
     #if $task.state == $koji.TASK_STATES.OPEN
     #if $estCompletion
     <tr>
@@ -251,7 +281,7 @@
       </td>
     </tr>
     #end if
-    #if $task.method == 'createLiveCD' and $image
+    #if ($task.method == 'createLiveCD' or $task.method == 'createAppliance') and $image
     <tr>
       <th>Image</th>
       <td>
@@ -259,9 +289,10 @@
       </td>
     </tr>
     #end if
+    #if not ($task.method == 'createLiveCD' or $task.method == 'createAppliance')
     <tr>
       <th>Parent</th>
-      <td>
+        <td>
         #if $parent
         <a href="taskinfo?taskID=$parent.id" class="task$util.taskState($parent.state)">$koji.taskLabel($parent)</a>
         #end if
@@ -276,6 +307,7 @@
         $printChildren($task.id, $descendents)
       </td>
     </tr>
+    #end if
     <tr>
       <th>Waiting?</th><td>#if $task.waiting then 'yes' else 'no'#</td>
     </tr>
@@ -312,12 +344,12 @@ ${excClass.__name__}: $cgi.escape($str($result))
         #for $filename in $output
         <a href="getfile?taskID=$task.id&name=$urllib.quote($filename)">$filename</a>
            #if $filename.endswith('.log')
-           (<a href="getfile?taskID=$task.id&name=$urllib.quote($filename)&offset=-2000">tail</a>)
+           (<a href="getfile?taskID=$task.id&name=$urllib.quote($filename)&offset=-4000">tail</a>)
            #end if
         <br/>
         #end for
         #if $task.state not in ($koji.TASK_STATES.CLOSED, $koji.TASK_STATES.CANCELED, $koji.TASK_STATES.FAILED) and \
-            $task.method in ('buildSRPMFromSCM', 'buildArch', 'createLiveCD', 'createrepo')
+            $task.method in ('buildSRPMFromSCM', 'buildArch', 'createLiveCD', 'createAppliance', 'buildMaven', 'wrapperRPM', 'createrepo')
         <br/>
         <a href="watchlogs?taskID=$task.id">Watch logs</a>
         #end if

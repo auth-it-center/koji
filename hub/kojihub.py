@@ -1,7 +1,7 @@
 # Python library
 
 # kojihub - library for koji's XMLRPC interface
-# Copyright (c) 2005-2007 Red Hat
+# Copyright (c) 2005-2010 Red Hat
 #
 #    Koji is free software; you can redistribute it and/or
 #    modify it under the terms of the GNU Lesser General Public
@@ -34,6 +34,8 @@ import logging
 import fcntl
 import fnmatch
 from koji.util import md5_constructor
+from koji.util import sha1_constructor
+from koji.util import dslice
 import os
 import random
 import re
@@ -41,20 +43,22 @@ import rpm
 import stat
 import subprocess
 import sys
+import tarfile
 import tempfile
 import time
 import types
 import xmlrpclib
+import zipfile
 from koji.context import context
 
 
 logger = logging.getLogger('koji.hub')
 
 def log_error(msg):
-    if hasattr(context,'req'):
-        context.req.log_error(msg)
-    else:
-        sys.stderr.write(msg + "\n")
+    #if hasattr(context,'req'):
+    #    context.req.log_error(msg)
+    #else:
+    #    sys.stderr.write(msg + "\n")
     logger.error(msg)
 
 
@@ -66,6 +70,8 @@ class Task(object):
                 ('task.state', 'state'),
                 ('task.create_time', 'create_time'),
                 ('EXTRACT(EPOCH FROM create_time)','create_ts'),
+                ('task.start_time', 'start_time'),
+                ('EXTRACT(EPOCH FROM task.start_time)', 'start_ts'),
                 ('task.completion_time', 'completion_time'),
                 ('EXTRACT(EPOCH FROM completion_time)','completion_ts'),
                 ('task.channel_id', 'channel_id'),
@@ -168,9 +174,11 @@ class Task(object):
         #  - assigned to host_id
         #  - force option is enabled
         state = koji.TASK_STATES[newstate]
-        q = """UPDATE task SET state=%(state)s,host_id=%(host_id)s
-        WHERE id=%(task_id)s"""
-        _dml(q,locals())
+        update = UpdateProcessor('task', clauses=['id=%(task_id)i'], values=locals())
+        update.set(state=state, host_id=host_id)
+        if state == koji.TASK_STATES['OPEN']:
+            update.rawset(start_time='NOW()')
+        update.execute()
         self.runCallbacks('postTaskStateChange', info, 'state', koji.TASK_STATES[newstate])
         self.runCallbacks('postTaskStateChange', info, 'host_id', host_id)
         return True
@@ -188,8 +196,9 @@ class Task(object):
         if self.lock(host_id,'OPEN'):
             # get more complete data to return
             fields = self.fields + (('task.request', 'request'),)
-            q = """SELECT %s FROM task WHERE id=%%(id)i""" % ','.join([f[0] for f in fields])
-            ret = _singleRow(q, vars(self), [f[1] for f in fields], strict=True)
+            query = QueryProcessor(tables=['task'], clauses=['id=%(id)i'], values=vars(self),
+                            columns=[f[0] for f in fields], aliases=[f[1] for f in fields])
+            ret = query.executeOne()
             if ret['request'].find('<?xml', 0, 10) == -1:
                 #handle older base64 encoded data
                 ret['request'] = base64.decodestring(ret['request'])
@@ -470,37 +479,68 @@ def make_task(method,arglist,**opts):
             raise koji.GenericError, "Parent task (id %(parent)s) is not open" % opts
         #default to a higher priority than parent
         opts.setdefault('priority', pdata['priority'] - 1)
-        for f in ('owner','channel_id','arch'):
+        for f in ('owner', 'arch'):
             opts.setdefault(f,pdata[f])
         opts.setdefault('label',None)
     else:
         opts.setdefault('priority',koji.PRIO_DEFAULT)
         #calling function should enforce priority limitations, if applicable
         opts.setdefault('arch','noarch')
-        opts.setdefault('channel','default')
-        #no labels for top-level tasks
-        #calling function should enforce channel limitations, if applicable
-        opts['channel_id'] = get_channel_id(opts['channel'],strict=True)
         if not context.session.logged_in:
             raise koji.GenericError, 'task must have an owner'
         else:
             opts['owner'] = context.session.user_id
         opts['label'] = None
         opts['parent'] = None
-    #XXX - temporary workaround
-    if method in ('buildArch', 'buildSRPMFromSCM') and opts['arch'] == 'noarch':
-        #not all arches can generate a proper buildroot for all tags
-        tag = get_tag(arglist[1])
-        if not tag['arches']:
-            raise koji.BuildError, 'no arches defined for tag %s' % tag['name']
-        # canonicalize tagarches, since get_all_arches() is canonical but
-        # non-canonical arches may be set in tag['arches']
-        tagarches = [koji.canonArch(a) for a in tag['arches'].split()]
-        for a in get_all_arches():
-            if a not in tagarches:
-                random.seed()
-                opts['arch'] = random.choice(tagarches)
-                break
+    #determine channel from policy
+    policy_data = {}
+    policy_data['method'] = method
+    for key in 'arch', 'parent', 'label', 'owner':
+        policy_data[key] = opts[key]
+    policy_data['user_id'] = opts['owner']
+    if 'channel' in opts:
+        policy_data['req_channel'] = opts['channel']
+        req_channel_id = get_channel_id(opts['channel'], strict=True)
+    if method == 'build':
+        # arglist = source, target, [opts]
+        args = koji.decode_args2(arglist, ('source', 'target', 'opts'))
+        policy_data['source'] = args['source']
+        if args['target'] is None:
+            #koji-shadow makes null-target builds
+            policy_data['target'] = None
+        else:
+            target = get_build_target(args['target'], strict=True)
+            policy_data['target'] = target['name']
+        t_opts = args.get('opts', {})
+        policy_data['scratch'] = t_opts.get('scratch', False)
+    ruleset = context.policy.get('channel')
+    result = ruleset.apply(policy_data)
+    if result is None:
+        logger.warning('Channel policy returned no result, using default')
+        opts['channel_id'] = get_channel_id('default', strict=True)
+    else:
+        try:
+            parts = result.split()
+            if parts[0] == "use":
+                opts['channel_id'] = get_channel_id(parts[1], strict=True)
+            elif parts[0] == "parent":
+                if not opts.get('parent'):
+                    logger.error("Invalid channel policy result (no parent task): %s",
+                                    ruleset.last_rule())
+                    raise koji.GenericError, "invalid channel policy"
+                opts['channel_id'] = pdata['channel_id']
+            elif parts[0] == "req":
+                if 'channel' not in opts:
+                    logger.error('Invalid channel policy result (no channel requested): %s',
+                                    ruleset.last_rule())
+                    raise koji.GenericError, "invalid channel policy"
+                opts['channel_id'] = req_channel_id
+            else:
+                logger.error("Invalid result from channel policy: %s", ruleset.last_rule())
+                raise koji.GenericError, "invalid channel policy"
+        except IndexError:
+            logger.error("Invalid result from channel policy: %s", ruleset.last_rule())
+            raise koji.GenericError, "invalid channel policy"
 
     # encode xmlrpc request
     opts['request'] = xmlrpclib.dumps(tuple(arglist), methodname=method,
@@ -642,17 +682,14 @@ def writeInheritanceData(tag_id, changes, clear=False):
         #oops, duplicate entries for a single priority
         dup_ids = [ link['parent_id'] for link in dups]
         raise koji.GenericError, "Inheritance priorities must be unique (pri %s: %r )" % (pri, dup_ids)
-    # get an event
-    event = _singleValue("SELECT get_event()")
     for parent_id, link in data.iteritems():
         if not link.get('is_update'):
             continue
         # revoke old values
-        q = """
-        UPDATE tag_inheritance SET active=NULL,revoke_event=%(event)s
-        WHERE tag_id=%(tag_id)s AND parent_id = %(parent_id)s AND active = TRUE
-        """
-        _dml(q,locals())
+        update = UpdateProcessor('tag_inheritance', values=locals(),
+                    clauses=['tag_id=%(tag_id)s', 'parent_id = %(parent_id)s'])
+        update.make_revoke()
+        update.execute()
     for parent_id, link in data.iteritems():
         if not link.get('is_update'):
             continue
@@ -660,20 +697,12 @@ def writeInheritanceData(tag_id, changes, clear=False):
         if link.get('delete link'):
             continue
         # insert new value
-        newlink = {}
-        for f in fields:
-            newlink[f] = link[f]
+        newlink = dslice(link, fields)
         newlink['tag_id'] = tag_id
-        newlink['create_event'] = event
         # defaults ok for the rest
-        keys = newlink.keys()
-        flist = ','.join(["%s" % k for k in keys])
-        vlist = ','.join(["%%(%s)s" % k for k in keys])
-        q = """
-        INSERT INTO tag_inheritance (%(flist)s)
-        VALUES (%(vlist)s)
-        """ % locals()
-        _dml(q,newlink)
+        insert = InsertProcessor('tag_inheritance', data=newlink)
+        insert.make_create()
+        insert.execute()
 
 def readFullInheritance(tag_id,event=None,reverse=False,stops={},jumps={}):
     """Returns a list representing the full, ordered inheritance from tag"""
@@ -773,21 +802,21 @@ def readFullInheritanceRecurse(tag_id,event,order,prunes,top,hist,currdepth,maxd
 #       list
 
 
-def _pkglist_remove(tag_id,pkg_id,event_id=None):
-    if event_id is None:
-        event_id = _singleValue("SELECT get_event()")
-    q = """UPDATE tag_packages SET active=NULL,revoke_event=%(event_id)i
-    WHERE active = TRUE AND package_id=%(pkg_id)i AND tag_id=%(tag_id)i"""
-    _dml(q,locals())
+def _pkglist_remove(tag_id, pkg_id):
+    clauses = ('package_id=%(pkg_id)i', 'tag_id=%(tag_id)i')
+    update = UpdateProcessor('tag_packages', values=locals(), clauses=clauses)
+    update.make_revoke()  #XXX user_id?
+    update.execute()
 
-def _pkglist_add(tag_id,pkg_id,owner,block,extra_arches,event_id=None):
-    if event_id is None:
-        event_id = _singleValue("SELECT get_event()")
+def _pkglist_add(tag_id, pkg_id, owner, block, extra_arches):
     #revoke old entry (if present)
-    _pkglist_remove(tag_id,pkg_id,event_id)
-    q = """INSERT INTO tag_packages(package_id,tag_id,owner,blocked,extra_arches,create_event)
-    VALUES (%(pkg_id)s,%(tag_id)s,%(owner)s,%(block)s,%(extra_arches)s,%(event_id)s) """
-    _dml(q,locals())
+    _pkglist_remove(tag_id, pkg_id)
+    data = dslice(locals(), ('tag_id', 'owner', 'extra_arches'))
+    data['package_id'] = pkg_id
+    data['blocked'] = block
+    insert = InsertProcessor('tag_packages', data=data)
+    insert.make_create()  #XXX user_id?
+    insert.execute()
 
 def pkglist_add(taginfo,pkginfo,owner=None,block=None,extra_arches=None,force=False,update=False):
     """Add to (or update) package list for tag"""
@@ -809,7 +838,7 @@ def pkglist_add(taginfo,pkginfo,owner=None,block=None,extra_arches=None,force=Fa
     context.session.assertLogin()
     policy_data = {'tag' : tag_id, 'action' : action, 'package' : pkginfo, 'force' : force}
     #don't check policy for admins using force
-    if not force or not context.session.hasPerm('admin'):
+    if not (force and context.session.hasPerm('admin')):
         assert_policy('package_list', policy_data)
     if not pkg:
         pkg = lookup_package(pkginfo, create=True)
@@ -874,7 +903,7 @@ def pkglist_remove(taginfo,pkginfo,force=False):
     context.session.assertLogin()
     policy_data = {'tag' : tag['id'], 'action' : 'remove', 'package' : pkg['id'], 'force' : force}
     #don't check policy for admins using force
-    if not force or not context.session.hasPerm('admin'):
+    if not (force and context.session.hasPerm('admin')):
         assert_policy('package_list', policy_data)
     koji.plugin.run_callbacks('prePackageListChange', action='remove', tag=tag, package=pkg)
     _pkglist_remove(tag['id'],pkg['id'])
@@ -895,7 +924,7 @@ def pkglist_unblock(taginfo, pkginfo, force=False):
     context.session.assertLogin()
     policy_data = {'tag' : tag['id'], 'action' : 'unblock', 'package' : pkg['id'], 'force' : force}
     #don't check policy for admins using force
-    if not force or not context.session.hasPerm('admin'):
+    if not (force and context.session.hasPerm('admin')):
         assert_policy('package_list', policy_data)
     koji.plugin.run_callbacks('prePackageListChange', action='unblock', tag=tag, package=pkg)
     tag_id = tag['id']
@@ -907,19 +936,16 @@ def pkglist_unblock(taginfo, pkginfo, force=False):
                 % (pkg['name'],tag['name'])
     if not previous['blocked']:
         raise koji.GenericError, "package %s NOT blocked in tag %s" % (pkg['name'],tag['name'])
-    event_id = _singleValue("SELECT get_event()")
     if previous['tag_id'] != tag_id:
         _pkglist_add(tag_id,pkg_id,previous['owner_id'],False,previous['extra_arches'])
     else:
         #just remove the blocking entry
-        event_id = _singleValue("SELECT get_event()")
-        _pkglist_remove(tag_id,pkg_id,event_id)
+        _pkglist_remove(tag_id, pkg_id)
         #it's possible this was the only entry in the inheritance or that the next entry
         #back is also a blocked entry. if so, we need to add it back as unblocked
         pkglist = readPackageList(tag_id, pkgID=pkg_id, inherit=True)
         if not pkglist.has_key(pkg_id) or pkglist[pkg_id]['blocked']:
-            _pkglist_add(tag_id,pkg_id,previous['owner_id'],False,previous['extra_arches'],
-                         event_id)
+            _pkglist_add(tag_id, pkg_id, previous['owner_id'], False, previous['extra_arches'])
     koji.plugin.run_callbacks('postPackageListChange', action='unblock', tag=tag, package=pkg)
 
 def pkglist_setowner(taginfo,pkginfo,owner,force=False):
@@ -1018,12 +1044,15 @@ def readPackageList(tagID=None, userID=None, pkgID=None, event=None, inherit=Fal
     return packages
 
 
-def readTaggedBuilds(tag,event=None,inherit=False,latest=False,package=None,owner=None):
+def readTaggedBuilds(tag,event=None,inherit=False,latest=False,package=None,owner=None,type=None):
     """Returns a list of builds for specified tag
 
     set inherit=True to follow inheritance
     set event to query at a time in the past
     set latest=True to get only the latest build per package
+
+    If type is not None, restrict the list to builds of the given type.  Currently the only
+    supported type is 'maven'.
     """
     # build - id pkg_id version release epoch
     # tag_listing - id build_id tag_id
@@ -1037,7 +1066,7 @@ def readTaggedBuilds(tag,event=None,inherit=False,latest=False,package=None,owne
     packages = readPackageList(tagID=tag, event=event, inherit=True, pkgID=package)
 
     #these values are used for each iteration
-    fields = (('tag.id', 'tag_id'), ('tag.name', 'tag_name'), ('build.id', 'id'),
+    fields = [('tag.id', 'tag_id'), ('tag.name', 'tag_name'), ('build.id', 'id'),
               ('build.id', 'build_id'), ('build.version', 'version'), ('build.release', 'release'),
               ('build.epoch', 'epoch'), ('build.state', 'state'), ('build.completion_time', 'completion_time'),
               ('build.task_id','task_id'),
@@ -1045,19 +1074,31 @@ def readTaggedBuilds(tag,event=None,inherit=False,latest=False,package=None,owne
               ('package.id', 'package_id'), ('package.name', 'package_name'),
               ('package.name', 'name'),
               ("package.name || '-' || build.version || '-' || build.release", 'nvr'),
-              ('users.id', 'owner_id'), ('users.name', 'owner_name'))
+              ('users.id', 'owner_id'), ('users.name', 'owner_name')]
     st_complete = koji.BUILD_STATES['COMPLETE']
+
+    maven_join = ''
+    if type is None:
+        pass
+    elif type == 'maven':
+        maven_join = 'JOIN maven_builds on maven_builds.build_id = tag_listing.build_id'
+        fields.extend([('maven_builds.group_id', 'maven_group_id'),
+                       ('maven_builds.artifact_id', 'maven_artifact_id'),
+                       ('maven_builds.version', 'maven_version')])
+    else:
+        raise koji.GenericError, 'unsupported build type: %s' % type
 
     q="""SELECT %s
     FROM tag_listing
     JOIN tag ON tag.id = tag_listing.tag_id
     JOIN build ON build.id = tag_listing.build_id
+    %s
     JOIN users ON users.id = build.owner
     JOIN events ON events.id = build.create_event
     JOIN package ON package.id = build.pkg_id
     WHERE %s AND tag_id=%%(tagid)s
         AND build.state=%%(st_complete)i
-    """ % (', '.join([pair[0] for pair in fields]), eventCondition(event, 'tag_listing'))
+    """ % (', '.join([pair[0] for pair in fields]), maven_join, eventCondition(event, 'tag_listing'))
     if package:
         q += """AND package.name = %(package)s
         """
@@ -1090,12 +1131,15 @@ def readTaggedBuilds(tag,event=None,inherit=False,latest=False,package=None,owne
 
     return builds
 
-def readTaggedRPMS(tag, package=None, arch=None, event=None,inherit=False,latest=True,rpmsigs=False,owner=None):
+def readTaggedRPMS(tag, package=None, arch=None, event=None,inherit=False,latest=True,rpmsigs=False,owner=None,type=None):
     """Returns a list of rpms for specified tag
 
     set inherit=True to follow inheritance
     set event to query at a time in the past
     set latest=False to get all tagged RPMS (not just from the latest builds)
+
+    If type is not None, restrict the list to rpms from builds of the given type.  Currently the only
+    supported type is 'maven'.
     """
     taglist = [tag]
     if inherit:
@@ -1103,7 +1147,7 @@ def readTaggedRPMS(tag, package=None, arch=None, event=None,inherit=False,latest
         #   (however, it is fairly quick)
         taglist += [link['parent_id'] for link in readFullInheritance(tag, event)]
 
-    builds = readTaggedBuilds(tag, event=event, inherit=inherit, latest=latest, package=package, owner=owner)
+    builds = readTaggedBuilds(tag, event=event, inherit=inherit, latest=latest, package=package, owner=owner, type=type)
     #index builds
     build_idx = dict([(b['build_id'],b) for b in builds])
 
@@ -1175,6 +1219,88 @@ def readTaggedRPMS(tag, package=None, arch=None, event=None,inherit=False,latest
             rpms.append(rpminfo)
     return [rpms,builds]
 
+def readTaggedArchives(tag, package=None, event=None, inherit=False, latest=True, type=None):
+    """Returns a list of archives for specified tag
+
+    set inherit=True to follow inheritance
+    set event to query at a time in the past
+    set latest=False to get all tagged archives (not just from the latest builds)
+
+    If type is not None, restrict the listing to archives of the given type.  Currently
+    the only supported type is 'maven'.
+    """
+    taglist = [tag]
+    if inherit:
+        #XXX really should cache this - it gets called several places
+        #   (however, it is fairly quick)
+        taglist += [link['parent_id'] for link in readFullInheritance(tag, event)]
+
+    # If type == 'maven', we require that both the build *and* the archive have Maven metadata
+    builds = readTaggedBuilds(tag, event=event, inherit=inherit, latest=latest, package=package, type=type)
+    #index builds
+    build_idx = dict([(b['build_id'],b) for b in builds])
+
+    #the following query is run for each tag in the inheritance
+    fields = [('archiveinfo.id', 'id'),
+              ('archiveinfo.type_id', 'type_id'),
+              ('archiveinfo.build_id', 'build_id'),
+              ('archiveinfo.buildroot_id', 'buildroot_id'),
+              ('archiveinfo.filename', 'filename'),
+              ('archiveinfo.size', 'size'),
+              ('archiveinfo.md5sum', 'md5sum')]
+              
+    tables = ['archiveinfo']
+    joins = ['tag_listing ON archiveinfo.build_id = tag_listing.build_id']
+    clauses = [eventCondition(event), 'tag_listing.tag_id = %(tagid)i']
+    if package:
+        joins.append('build ON archiveinfo.build_id = build.id')
+        joins.append('package ON build.pkg_id = package.id')
+        clauses.append('package.name = %(package)s')
+    if type is None:
+        pass
+    elif type == 'maven':
+        joins.append('maven_archives ON archiveinfo.id = maven_archives.archive_id')
+        fields.extend([('maven_archives.group_id', 'maven_group_id'),
+                       ('maven_archives.artifact_id', 'maven_artifact_id'),
+                       ('maven_archives.version', 'maven_version')])
+    else:
+        raise koji.GenericError, 'unsupported archive type: %s' % type
+
+    query = QueryProcessor(tables=tables, joins=joins, clauses=clauses,
+                           columns=[pair[0] for pair in fields],
+                           aliases=[pair[1] for pair in fields])
+
+    # unique constraints ensure that each of these queries will not report
+    # duplicate archiveinfo entries, BUT since we make the query multiple times,
+    # we can get duplicates if a package is multiply tagged.
+    archives = []
+    tags_seen = {}
+    for tagid in taglist:
+        if tags_seen.has_key(tagid):
+            #certain inheritance trees can (legitimately) have the same tag
+            #appear more than once (perhaps once with a package filter and once
+            #without). The hard part of that was already done by readTaggedBuilds.
+            #We only need consider each tag once. Note how we use build_idx below.
+            #(Without this, we could report the same rpm twice)
+            continue
+        else:
+            tags_seen[tagid] = 1
+        query.values = {'tagid': tagid, 'package': package}
+        for archiveinfo in query.execute():
+            #note: we're checking against the build list because
+            # it has been filtered by the package list. The tag
+            # tools should endeavor to keep tag_listing sane w.r.t.
+            # the package list, but if there is disagreement the package
+            # list should take priority
+            build = build_idx.get(archiveinfo['build_id'],None)
+            if build is None:
+                continue
+            elif build['tag_id'] != tagid:
+                #wrong tag
+                continue
+            archives.append(archiveinfo)
+    return [archives, builds]
+
 def check_tag_access(tag_id,user_id=None):
     """Determine if user has access to tag package with tag.
 
@@ -1197,7 +1323,7 @@ def check_tag_access(tag_id,user_id=None):
     if tag['perm_id']:
         needed_perm = lookup_perm(tag['perm_id'],strict=True)['name']
         if needed_perm not in perms:
-            return (False, override, "tag is locked")
+            return (False, override, "tag requires %s permission" % needed_perm)
     return (True,override,"")
 
 def assert_tag_access(tag_id,user_id=None,force=False):
@@ -1234,28 +1360,30 @@ def _tag_build(tag,build,user_id=None,force=False):
         raise koji.TagError, "build %s not complete: state %s" % (nvr,state)
     #access check
     assert_tag_access(tag['id'],user_id=user_id,force=force)
-    #XXX - add another check based on package ownership?
     # see if it's already tagged
     retag = False
-    q = """SELECT build_id FROM tag_listing WHERE tag_id=%(tag_id)i
-    AND build_id=%(build_id)i AND active = TRUE FOR UPDATE"""
+    table = 'tag_listing'
+    clauses = ('tag_id=%(tag_id)i', 'build_id=%(build_id)i')
+    query = QueryProcessor(columns=['build_id'], tables=[table],
+                           clauses=('active = TRUE',)+clauses,
+                           values=locals(), opts={'rowlock':True})
     #note: tag_listing is unique on (build_id, tag_id, active)
-    if _fetchSingle(q,locals()):
+    if query.executeOne():
         #already tagged
         if not force:
             raise koji.TagError, "build %s already tagged (%s)" % (nvr,tag['name'])
         #otherwise we retag
         retag = True
-    event_id = _singleValue("SELECT get_event()")
     if retag:
         #revoke the old tag first
-        q = """UPDATE tag_listing SET active=NULL,revoke_event=%(event_id)i
-        WHERE tag_id=%(tag_id)i AND build_id=%(build_id)i AND active = TRUE"""
-        _dml(q,locals())
+        update = UpdateProcessor(table, values=locals(), clauses=clauses)
+        update.make_revoke(user_id=user_id)
+        update.execute()
     #tag the package
-    q = """INSERT INTO tag_listing(tag_id,build_id,active,create_event)
-    VALUES(%(tag_id)i,%(build_id)i,TRUE,%(event_id)i)"""
-    _dml(q,locals())
+    insert = InsertProcessor(table)
+    insert.set(tag_id=tag_id, build_id=build_id)
+    insert.make_create(user_id=user_id)
+    insert.execute()
     koji.plugin.run_callbacks('postTag', tag=tag, build=build, user=user, force=force)
 
 def _untag_build(tag,build,user_id=None,strict=True,force=False):
@@ -1278,11 +1406,10 @@ def _untag_build(tag,build,user_id=None,strict=True,force=False):
     tag_id = tag['id']
     build_id = build['id']
     assert_tag_access(tag_id,user_id=user_id,force=force)
-    #XXX - add another check based on package ownership?
-    q = """UPDATE tag_listing SET active=NULL,revoke_event=get_event()
-    WHERE tag_id=%(tag_id)i AND build_id=%(build_id)i AND active = TRUE
-    """
-    count = _dml(q,locals())
+    update = UpdateProcessor('tag_listing', values=locals(),
+                clauses=['tag_id=%(tag_id)i', 'build_id=%(build_id)i'])
+    update.make_revoke(user_id=user_id)
+    count = update.execute()
     if count == 0 and strict:
         nvr = "%(name)s-%(version)s-%(release)s" % build
         raise koji.TagError, "build %s not in tag %s" % (nvr,tag['name'])
@@ -1307,6 +1434,8 @@ def grplist_add(taginfo,grpinfo,block=False,force=False,**opts):
     previous = groups.get(group['id'],None)
     cfg_fields = ('exported','display_name','is_default','uservisible',
                   'description','langonly','biarchonly',)
+    #prevent user-provided opts from doing anything strange
+    opts = dslice(opts, cfg_fields, strict=False)
     if previous is not None:
         #already there (possibly via inheritance)
         if previous['blocked'] and not force:
@@ -1330,20 +1459,17 @@ def grplist_add(taginfo,grpinfo,block=False,force=False,**opts):
     opts.setdefault('uservisible',True)
     # XXX ^^^
     opts['tag_id'] = tag['id']
-    opts['grp_id'] = group['id']
+    opts['group_id'] = group['id']
     opts['blocked'] = block
-    opts['event_id'] = _singleValue("SELECT get_event()")
     #revoke old entry (if present)
-    q = """UPDATE group_config SET active=NULL,revoke_event=%(event_id)s
-    WHERE active = TRUE AND group_id=%(grp_id)s AND tag_id=%(tag_id)s"""
-    _dml(q,opts)
+    update = UpdateProcessor('group_config', values=opts,
+                clauses=['group_id=%(group_id)s', 'tag_id=%(tag_id)s'])
+    update.make_revoke()
+    update.execute()
     #add new entry
-    x_fields = filter(opts.has_key,cfg_fields)
-    params = [ '%%(%s)s' % f for f in x_fields ]
-    q = """INSERT INTO group_config(group_id,tag_id,blocked,create_event,%s)
-    VALUES (%%(grp_id)s,%%(tag_id)s,%%(blocked)s,%%(event_id)s,%s) """ \
-        % ( ','.join(x_fields), ','.join(params))
-    _dml(q,opts)
+    insert = InsertProcessor('group_config', data=opts)
+    insert.make_create()
+    insert.execute()
 
 def grplist_remove(taginfo,grpinfo,force=False):
     """Remove group from the list for tag
@@ -1357,9 +1483,10 @@ def grplist_remove(taginfo,grpinfo,force=False):
     group = lookup_group(grpinfo, strict=True)
     tag_id = tag['id']
     grp_id = group['id']
-    q = """UPDATE group_config SET active=NULL,revoke_event=get_event()
-    WHERE active = TRUE AND package_id=%(pkg_id)s AND tag_id=%(tag_id)s"""
-    _dml(q,locals())
+    clauses = ['group_id=%(grp_id)s', 'tag_id=%(tag_id)s']
+    update = UpdateProcessor('group_config', values=locals(), clauses=clauses)
+    update.make_revoke()
+    update.execute()
 
 def grplist_block(taginfo,grpinfo):
     """Block the group in tag"""
@@ -1377,15 +1504,17 @@ def grplist_unblock(taginfo,grpinfo):
     group = lookup_group(grpinfo,strict=True)
     tag_id = tag['id']
     grp_id = group['id']
-    q = """SELECT blocked FROM group_config
-    WHERE active = TRUE AND group_id=%(grp_id)s AND tag_id=%(tag_id)s
-    FOR UPDATE"""
-    blocked = _singleValue(q,locals())
+    table = 'group_config'
+    clauses = ('group_id=%(grp_id)s', 'tag_id=%(tag_id)s')
+    query = QueryProcessor(columns=['blocked'], tables=[table],
+                           clauses=('active = TRUE',)+clauses,
+                           values=locals(), opts={'rowlock':True})
+    blocked = query.singleValue(strict=False)
     if not blocked:
         raise koji.GenericError, "group %s is NOT blocked in tag %s" % (group['name'],tag['name'])
-    q = """UPDATE group_config SET active=NULL,revoke_event=get_event()
-    WHERE id=%(row_id)s"""
-    _dml(q,locals())
+    update = UpdateProcessor(table, values=locals(), clauses=clauses)
+    update.make_revoke()
+    update.execute()
 
 
 # tag-group-pkg operations
@@ -1411,6 +1540,8 @@ def grp_pkg_add(taginfo,grpinfo,pkg_name,block=False,force=False,**opts):
         raise koji.GenericError, "group %s is blocked in tag %s" % (group['name'],tag['name'])
     previous = grp_cfg['packagelist'].get(pkg_name,None)
     cfg_fields = ('type','basearchonly','requires')
+    #prevent user-provided opts from doing anything strange
+    opts = dslice(opts, cfg_fields, strict=False)
     if previous is not None:
         #already there (possibly via inheritance)
         if previous['blocked'] and not force:
@@ -1432,26 +1563,20 @@ def grp_pkg_add(taginfo,grpinfo,pkg_name,block=False,force=False,**opts):
         if not changed and not force:
             #no point in adding it again with the same data (unless force is on)
             return
-    #XXX - sanity check data?
     opts.setdefault('type','default')
     opts['group_id'] = group['id']
     opts['tag_id'] = tag['id']
     opts['package'] = pkg_name
     opts['blocked'] = block
-    opts['event_id'] = _singleValue("SELECT get_event()")
     #revoke old entry (if present)
-    q = """UPDATE group_package_listing SET active=NULL,revoke_event=%(event_id)s
-    WHERE active = TRUE AND group_id=%(group_id)s AND tag_id=%(tag_id)s
-        AND package=%(package)s"""
-    _dml(q,opts)
+    update = UpdateProcessor('group_package_listing', values=opts,
+                clauses=['group_id=%(group_id)s', 'tag_id=%(tag_id)s', 'package=%(package)s'])
+    update.make_revoke()
+    update.execute()
     #add new entry
-    x_fields = filter(opts.has_key,cfg_fields) \
-                + ('group_id','tag_id','package','blocked')
-    params = [ '%%(%s)s' % f for f in x_fields ]
-    q = """INSERT INTO group_package_listing(create_event,%s)
-    VALUES (%%(event_id)s,%s) """ \
-        % ( ','.join(x_fields), ','.join(params))
-    _dml(q,opts)
+    insert = InsertProcessor('group_package_listing', data=opts)
+    insert.make_create()
+    insert.execute()
 
 def grp_pkg_remove(taginfo,grpinfo,pkg_name,force=False):
     """Remove package from the list for group-tag
@@ -1463,10 +1588,10 @@ def grp_pkg_remove(taginfo,grpinfo,pkg_name,force=False):
     context.session.assertPerm('admin')
     tag_id = get_tag_id(taginfo,strict=True)
     grp_id = get_group_id(grpinfo,strict=True)
-    q = """UPDATE group_package_listing SET active=NULL,revoke_event=get_event()
-    WHERE active = TRUE AND package=%(pkg_name)s AND tag_id=%(tag_id)s
-            AND group_id = %(grp_id)s"""
-    _dml(q,locals())
+    update = UpdateProcessor('group_package_listing', values=locals(),
+                clauses=['package=%(pkg_name)s', 'tag_id=%(tag_id)s', 'group_id = %(grp_id)s'])
+    update.make_revoke()
+    update.execute()
 
 def grp_pkg_block(taginfo,grpinfo, pkg_name):
     """Block the package in group-tag"""
@@ -1480,20 +1605,20 @@ def grp_pkg_unblock(taginfo,grpinfo,pkg_name):
     """
     # only admins...
     context.session.assertPerm('admin')
+    table = 'group_package_listing'
     tag_id = get_tag_id(taginfo,strict=True)
     grp_id = get_group_id(grpinfo,strict=True)
-    q = """SELECT blocked FROM group_package_listing
-    WHERE active = TRUE AND group_id=%(grp_id)s AND tag_id=%(tag_id)s
-            AND package = %(pkg_name)s
-    FOR UPDATE"""
-    blocked = _singleValue(q, locals(), strict=False)
+    clauses = ('group_id=%(grp_id)s', 'tag_id=%(tag_id)s', 'package = %(pkg_name)s')
+    query = QueryProcessor(columns=['blocked'], tables=[table],
+                           clauses=('active = TRUE',)+clauses,
+                           values=locals(), opts={'rowlock':True})
+    blocked = query.singleValue(strict=False)
     if not blocked:
         raise koji.GenericError, "package %s is NOT blocked in group %s, tag %s" \
                     % (pkg_name,grp_id,tag_id)
-    q = """UPDATE group_package_listing SET active=NULL,revoke_event=get_event()
-    WHERE active = TRUE AND group_id=%(grp_id)s AND tag_id=%(tag_id)s
-          AND package = %(pkg_name)s"""
-    _dml(q,locals())
+    update = UpdateProcessor('group_package_listing', values=locals(), clauses=clauses)
+    update.make_revoke()
+    update.execute()
 
 # tag-group-req operations
 #       add
@@ -1519,6 +1644,8 @@ def grp_req_add(taginfo,grpinfo,reqinfo,block=False,force=False,**opts):
         raise koji.GenericError, "group %s is blocked in tag %s" % (group['name'],tag['name'])
     previous = grp_cfg['grouplist'].get(req['id'],None)
     cfg_fields = ('type','is_metapkg')
+    #prevent user-provided opts from doing anything strange
+    opts = dslice(opts, cfg_fields, strict=False)
     if previous is not None:
         #already there (possibly via inheritance)
         if previous['blocked'] and not force:
@@ -1540,26 +1667,20 @@ def grp_req_add(taginfo,grpinfo,reqinfo,block=False,force=False,**opts):
         if not changed:
             #no point in adding it again with the same data
             return
-    #XXX - sanity check data?
     opts.setdefault('type','mandatory')
     opts['group_id'] = group['id']
     opts['tag_id'] = tag['id']
     opts['req_id'] = req['id']
     opts['blocked'] = block
-    opts['event_id'] = _singleValue("SELECT get_event()")
     #revoke old entry (if present)
-    q = """UPDATE group_req_listing SET active=NULL,revoke_event=%(event_id)s
-    WHERE active = TRUE AND group_id=%(group_id)s AND tag_id=%(tag_id)s
-            AND req_id=%(req_id)s"""
-    _dml(q,opts)
+    update = UpdateProcessor('group_req_listing', values=opts,
+                clauses=['group_id=%(group_id)s', 'tag_id=%(tag_id)s', 'req_id=%(req_id)s'])
+    update.make_revoke()
+    update.execute()
     #add new entry
-    x_fields = filter(opts.has_key,cfg_fields) \
-                + ('group_id','tag_id','req_id','blocked')
-    params = [ '%%(%s)s' % f for f in x_fields ]
-    q = """INSERT INTO group_req_listing(create_event,%s)
-    VALUES (%%(event_id)s,%s) """ \
-        % ( ','.join(x_fields), ','.join(params))
-    _dml(q,opts)
+    insert = InsertProcessor('group_req_listing', data=opts)
+    insert.make_create()
+    insert.execute()
 
 def grp_req_remove(taginfo,grpinfo,reqinfo,force=False):
     """Remove group requirement from the list for group-tag
@@ -1572,10 +1693,10 @@ def grp_req_remove(taginfo,grpinfo,reqinfo,force=False):
     tag_id = get_tag_id(taginfo,strict=True)
     grp_id = get_group_id(grpinfo,strict=True)
     req_id = get_group_id(reqinfo,strict=True)
-    q = """UPDATE group_req_listing SET active=NULL,revoke_event=get_event()
-    WHERE active = TRUE AND req_id=%(req_id)s AND tag_id=%(tag_id)s
-            AND group_id = %(grp_id)s"""
-    _dml(q,locals())
+    update = UpdateProcessor('group_req_listing', values=locals(),
+                clauses=['req_id=%(req_id)s', 'tag_id=%(tag_id)s', 'group_id = %(grp_id)s'])
+    update.make_revoke()
+    update.execute()
 
 def grp_req_block(taginfo,grpinfo,reqinfo):
     """Block the group requirement in group-tag"""
@@ -1592,17 +1713,19 @@ def grp_req_unblock(taginfo,grpinfo,reqinfo):
     tag_id = get_tag_id(taginfo,strict=True)
     grp_id = get_group_id(grpinfo,strict=True)
     req_id = get_group_id(reqinfo,strict=True)
-    q = """SELECT blocked FROM group_req_listing
-    WHERE active = TRUE AND group_id=%(grp_id)s AND tag_id=%(tag_id)s
-            AND req_id = %(req_id)s
-    FOR UPDATE"""
-    blocked = _singleValue(q,locals())
+    table = 'group_req_listing'
+
+    clauses = ('group_id=%(grp_id)s', 'tag_id=%(tag_id)s', 'req_id = %(req_id)s')
+    query = QueryProcessor(columns=['blocked'], tables=[table],
+                           clauses=('active = TRUE',)+clauses,
+                           values=locals(), opts={'rowlock':True})
+    blocked = query.singleValue(strict=False)
     if not blocked:
         raise koji.GenericError, "group req %s is NOT blocked in group %s, tag %s" \
                     % (req_id,grp_id,tag_id)
-    q = """UPDATE group_req_listing SET active=NULL,revoke_event=get_event()
-    WHERE id=%(row_id)s"""
-    _dml(q,locals())
+    update = UpdateProcessor('group_req_listing', values=locals(), clauses=clauses)
+    update.make_revoke()
+    update.execute()
 
 def get_tag_groups(tag,event=None,inherit=True,incl_pkgs=True,incl_reqs=True):
     """Return group data for the tag
@@ -1710,22 +1833,26 @@ def set_host_enabled(hostname, enabled=True):
     c.execute("""UPDATE host SET enabled = %(enabled)s WHERE name = %(hostname)s""", locals())
     context.commit_pending = True
 
-def add_host_to_channel(hostname, channel_name):
+def add_host_to_channel(hostname, channel_name, create=False):
+    """Add the host to the specified channel
+
+    Channel must already exist unless create option is specified
+    """
     context.session.assertPerm('admin')
     host = get_host(hostname)
     if host == None:
         raise koji.GenericError, 'host does not exist: %s' % hostname
     host_id = host['id']
-    channel_id = get_channel_id(channel_name)
+    channel_id = get_channel_id(channel_name, create=create)
     if channel_id == None:
         raise koji.GenericError, 'channel does not exist: %s' % channel_name
     channels = list_channels(host_id)
     for channel in channels:
         if channel['id'] == channel_id:
             raise koji.GenericError, 'host %s is already subscribed to the %s channel' % (hostname, channel_name)
-    c = context.cnx.cursor()
-    c.execute("""INSERT INTO host_channels (host_id, channel_id) values (%(host_id)d, %(channel_id)d)""", locals())
-    context.commit_pending = True
+    insert = InsertProcessor('host_channels')
+    insert.set(host_id=host_id, channel_id=channel_id)
+    insert.execute()
 
 def remove_host_from_channel(hostname, channel_name):
     context.session.assertPerm('admin')
@@ -1747,6 +1874,43 @@ def remove_host_from_channel(hostname, channel_name):
     c = context.cnx.cursor()
     c.execute("""DELETE FROM host_channels WHERE host_id = %(host_id)d and channel_id = %(channel_id)d""", locals())
     context.commit_pending = True
+
+def rename_channel(old, new):
+    """Rename a channel"""
+    context.session.assertPerm('admin')
+    if not isinstance(new, basestring):
+        raise koji.GenericError, "new channel name must be a string"
+    cinfo = get_channel(old, strict=True)
+    dup_check = get_channel(new, strict=False)
+    if dup_check:
+        raise koji.GenericError, "channel %(name)s already exists (id=%(id)i)" % dup_check
+    update = UpdateProcessor('channels', clauses=['id=%(id)i'], values=cinfo)
+    update.set(name=new)
+    update.execute()
+
+def remove_channel(channel_name, force=False):
+    """Remove a channel
+
+    Channel must have no hosts, unless force is set to True
+    If a channel has associated tasks, it cannot be removed
+    """
+    context.session.assertPerm('admin')
+    channel_id = get_channel_id(channel_name, strict=True)
+    # check for task references
+    query = QueryProcessor(tables=['task'], clauses=['channel_id=%(channel_id)i'],
+                    values=locals(), columns=['id'], opts={'limit':1})
+    #XXX slow query
+    if query.execute():
+        raise koji.GenericError, 'channel %s has task references' % channel_name
+    query = QueryProcessor(tables=['host_channels'], clauses=['channel_id=%(channel_id)i'],
+                    values=locals(), columns=['host_id'], opts={'limit':1})
+    if query.execute():
+        if not force:
+            raise koji.GenericError, 'channel %s has host references' % channel_name
+        delete = """DELETE FROM host_channels WHERE channel_id=%(channel_id)i"""
+        _dml(delete, locals())
+    delete = """DELETE FROM channels WHERE id=%(channel_id)i"""
+    _dml(delete, locals())
 
 def get_ready_hosts():
     """Return information about hosts that are ready to build.
@@ -1788,7 +1952,7 @@ def get_all_arches():
 def get_active_tasks():
     """Return data on tasks that are yet to be run"""
     c = context.cnx.cursor()
-    fields = ['id','state','channel_id','host_id','arch']
+    fields = ['id','state','channel_id','host_id','arch', 'method']
     q = """
     SELECT %s FROM task
     WHERE state IN (%%(FREE)s,%%(ASSIGNED)s)
@@ -1808,6 +1972,48 @@ def get_task_descendents(task, childMap=None, request=False):
     for child in children:
         get_task_descendents(Task(child['id']), childMap, request)
     return childMap
+
+def maven_tag_packages(taginfo, event_id):
+    """
+    Get Maven builds associated with the given tag, following inheritance.
+    For any parent tags where 'maven_include_all' is true, include all tagged
+    builds, not just the latest.  If there are multiple releases of the same
+    Maven groupId-artifactId-version, only take the latest release.
+    """
+    logger = logging.getLogger("koji.hub.repo_init")
+    if not taginfo['maven_support']:
+        return []
+
+    tag_id = taginfo['id']
+    # Get the latest Maven builds using the normal build resolution logic
+    builds = readTaggedBuilds(tag_id, event=event_id, inherit=True, latest=True, type='maven')
+
+    taglist = [tag_id]
+    taglist += [t['parent_id'] for t in readFullInheritance(tag_id, event=event_id)]
+    # Check if any tag in the inheritance hierarchy have maven_include_all == True
+    # If so, pull in all packages directly tagged into that tag as well
+    for maven_tag_id in taglist:
+        maven_tag = get_tag(maven_tag_id, strict=True)
+        if maven_tag['maven_include_all']:
+            logger.info('Including all packages in %s' % maven_tag['name'])
+            builds.extend(readTaggedBuilds(maven_tag['id'], event=event_id, inherit=False, latest=False, type='maven'))
+
+    seen = {}
+    results = []
+    # Since a Maven repo structure only has room for one version of a given groupId-artifactId, keep the
+    # first version found via the inheritance/tag-date mechanism, and skip all the rest
+    for build in builds:
+        maven_info = {'group_id': build['maven_group_id'],
+                      'artifact_id': build['maven_artifact_id'],
+                      'version': build['maven_version']}
+        maven_label = koji.mavenLabel(maven_info)
+        if seen.has_key(maven_label):
+            logger.info('Skipping duplicate Maven package: %s, build ID: %i' % (maven_label, build['id']))
+            continue
+        else:
+            results.append(build)
+            seen[maven_label] = True
+    return results
 
 def repo_init(tag, with_src=False, with_debuginfo=False, event=None):
     """Create a new repo entry in the INIT state, return full repo data
@@ -1836,6 +2042,8 @@ def repo_init(tag, with_src=False, with_debuginfo=False, event=None):
     q = """INSERT INTO repo(id, create_event, tag_id, state)
     VALUES(%(repo_id)s, %(event_id)s, %(tag_id)s, %(state)s)"""
     _dml(q,locals())
+    # Need to pass event_id because even though this is a single transaction,
+    # it is possible to see the results of other committed transactions
     rpms, builds = readTaggedRPMS(tag_id, event=event_id, inherit=True, latest=True)
     groups = readTagGroups(tag_id, event=event_id, inherit=True)
     blocks = [pkg for pkg in readPackageList(tag_id, event=event_id, inherit=True).values() \
@@ -1849,8 +2057,7 @@ def repo_init(tag, with_src=False, with_debuginfo=False, event=None):
     for repoarch in repo_arches:
         packages.setdefault(repoarch, [])
     for rpminfo in rpms:
-        if (rpminfo['name'].endswith('-debuginfo') or rpminfo['name'].endswith('-debuginfo-common')) \
-                and not with_debuginfo:
+        if not with_debuginfo and koji.is_debuginfo(rpminfo['name']):
             continue
         arch = rpminfo['arch']
         repoarch = koji.canonArch(arch)
@@ -1873,6 +2080,9 @@ def repo_init(tag, with_src=False, with_debuginfo=False, event=None):
     fo.write(comps)
     fo.close()
 
+    if context.opts.get('EnableMaven') and tinfo['maven_support']:
+        maven_builds = dict([(build['id'], build) for build in maven_tag_packages(tinfo, event_id)])
+    
     #link packages
     for arch in packages.iterkeys():
         if arch in ['src','noarch']:
@@ -1920,9 +2130,64 @@ def repo_init(tag, with_src=False, with_debuginfo=False, event=None):
                     blocklist.write('\n')
                 blocklist.close()
 
+    if context.opts.get('EnableMaven') and tinfo['maven_support']:
+        artifact_dirs = {}
+        for build in maven_builds.itervalues():
+            build_maven_info = {'group_id': build['maven_group_id'],
+                                'artifact_id': build['maven_artifact_id'],
+                                'version': build['maven_version']}
+            for archive_info in list_archives(buildID=build['id'], type='maven'):
+                _populate_maven_repodir(build, build_maven_info, archive_info, repodir, artifact_dirs)
+        for artifact_dir, artifacts in artifact_dirs.iteritems():
+            _write_maven_repo_metadata(artifact_dir, artifacts)
+
     koji.plugin.run_callbacks('postRepoInit', tag=tinfo, with_src=with_src, with_debuginfo=with_debuginfo,
                               event=event, repo_id=repo_id)
     return [repo_id, event_id]
+
+def _populate_maven_repodir(buildinfo, maveninfo, archiveinfo, repodir, artifact_dirs):
+    maven_pi = koji.PathInfo(topdir=repodir)
+    srcdir = koji.pathinfo.mavenbuild(buildinfo, maveninfo)
+    destdir = maven_pi.mavenrepo(buildinfo, archiveinfo)
+    koji.ensuredir(destdir)
+    filename = archiveinfo['filename']
+    # assume all artifacts we import have .md5 and .sha1 files associated with them in the global repo
+    for suffix in ('', '.md5', '.sha1'):
+        try:
+            os.symlink(os.path.join(srcdir, filename + suffix), os.path.join(destdir, filename + suffix))
+        except:
+            log_error('Error linking %s to %s' % (os.path.join(srcdir, filename + suffix), os.path.join(destdir, filename + suffix)))
+
+    artifact_dirs.setdefault(os.path.dirname(destdir), {})[(archiveinfo['group_id'],
+                                                            archiveinfo['artifact_id'],
+                                                            archiveinfo['version'])] = 1
+
+def _write_maven_repo_metadata(destdir, artifact_dict):
+    # Sort the list so that the highest version number comes last.
+    # group_id and artifact_id should be the same for all entries,
+    # so we're really only comparing versions.
+    artifacts = artifact_dict.keys()
+    artifacts.sort(cmp=lambda a, b: rpm.labelCompare(a, b))
+    artifactinfo = dict(zip(['group_id', 'artifact_id', 'version'], artifacts[-1]))
+    artifactinfo['timestamp'] = datetime.datetime.now().strftime('%Y%m%d%H%M%S')
+    contents = """<?xml version="1.0"?>
+<metadata>
+  <groupId>%(group_id)s</groupId>
+  <artifactId>%(artifact_id)s</artifactId>
+  <versioning>
+    <latest>%(version)s</latest>
+    <release>%(version)s</release>
+    <versions>
+"""
+    for artifact in artifacts:
+        contents += """      <version>%s</version>
+""" % artifact[2]
+    contents += """    </versions>
+    <lastUpdated>%(timestamp)s</lastUpdated>
+  </versioning>
+</metadata>
+"""
+    _generate_maven_metadata(artifactinfo, destdir, contents=contents)
 
 def repo_set_state(repo_id, state, check=True):
     """Set repo state"""
@@ -2078,10 +2343,10 @@ def create_build_target(name, build_tag, dest_tag):
     #is possible the name is in the system
     id = get_build_target_id(name,create=True)
 
-    insert = """INSERT into build_target_config (build_target_id, build_tag, dest_tag)
-    VALUES (%(id)d, %(build_tag)d, %(dest_tag)d)"""
-
-    _dml(insert, locals())
+    insert = InsertProcessor('build_target_config')
+    insert.set(build_target_id=id, build_tag=build_tag, dest_tag=dest_tag)
+    insert.make_create()
+    insert.execute()
 
 def edit_build_target(buildTargetInfo, name, build_tag, dest_tag):
     """Set the build_tag and dest_tag of an existing build_target to new values"""
@@ -2116,23 +2381,16 @@ def edit_build_target(buildTargetInfo, name, build_tag, dest_tag):
 
         _dml(rename, locals())
 
-    eventID = _singleValue("SELECT get_event()")
+    update = UpdateProcessor('build_target_config', values=locals(),
+                clauses=["build_target_id = %(buildTargetID)i"])
+    update.make_revoke()
 
-    update = """UPDATE build_target_config
-    SET active = NULL,
-    revoke_event = %(eventID)i
-    WHERE build_target_id = %(buildTargetID)i
-    AND active is true
-    """
+    insert = InsertProcessor('build_target_config')
+    insert.set(build_target_id=buildTargetID, build_tag=buildTagID, dest_tag=destTagID)
+    insert.make_create()
 
-    insert = """INSERT INTO build_target_config
-    (build_target_id, build_tag, dest_tag, create_event)
-    VALUES
-    (%(buildTargetID)i, %(buildTagID)i, %(destTagID)i, %(eventID)i)
-    """
-
-    _dml(update, locals())
-    _dml(insert, locals())
+    update.execute()
+    insert.execute()
 
 def delete_build_target(buildTargetInfo):
     """Delete the build target with the given name.  If no build target
@@ -2147,12 +2405,10 @@ def delete_build_target(buildTargetInfo):
 
     #build targets are versioned, so we do not delete them from the db
     #instead we revoke the config entry
-    delConfig = """UPDATE build_target_config
-    SET active=NULL,revoke_event=get_event()
-    WHERE build_target_id = %(targetID)i
-    """
-
-    _dml(delConfig, locals())
+    update = UpdateProcessor('build_target_config', values=locals(),
+                clauses=["build_target_id = %(targetID)i"])
+    update.make_revoke()
+    update.execute()
 
 def get_build_targets(info=None, event=None, buildTagID=None, destTagID=None, queryOpts=None):
     """Return data on all the build targets
@@ -2187,6 +2443,17 @@ def get_build_targets(info=None, event=None, buildTagID=None, destTagID=None, qu
                            tables=['build_target_config'], joins=joins, clauses=clauses,
                            values=locals(), opts=queryOpts)
     return query.execute()
+
+def get_build_target(info, event=None, strict=False):
+    """Return the build target with the given name or ID.
+    If there is no matching build target, return None."""
+    targets = get_build_targets(info=info, event=event)
+    if len(targets) == 1:
+        return targets[0]
+    elif strict:
+        raise koji.GenericError, 'No matching build target found: %s' % info
+    else:
+        return None
 
 def lookup_name(table,info,strict=False,create=False):
     """Find the id and name in the table associated with info.
@@ -2283,10 +2550,12 @@ def lookup_build_target(info,strict=False,create=False):
     """Get the id,name for build target"""
     return lookup_name('build_target',info,strict,create)
 
-def create_tag(name, parent=None, arches=None, perm=None, locked=False):
+def create_tag(name, parent=None, arches=None, perm=None, locked=False, maven_support=False, maven_include_all=False):
     """Create a new tag"""
 
     context.session.assertPerm('admin')
+    if not context.opts.get('EnableMaven') and (maven_support or maven_include_all):
+        raise koji.GenericError, "Maven support not enabled"
 
     #see if there is already a tag by this name (active)
     if get_tag(name):
@@ -2304,12 +2573,11 @@ def create_tag(name, parent=None, arches=None, perm=None, locked=False):
     #there may already be an id for a deleted tag, this will reuse it
     tag_id = get_tag_id(name,create=True)
 
-    c=context.cnx.cursor()
-
-    q = """INSERT INTO tag_config (tag_id,arches,perm_id,locked)
-    VALUES (%(tag_id)i,%(arches)s,%(perm)s,%(locked)s)"""
-    context.commit_pending = True
-    c.execute(q,locals())
+    insert = InsertProcessor('tag_config')
+    insert.set(tag_id=tag_id, arches=arches, perm_id=perm, locked=locked)
+    insert.set(maven_support=maven_support, maven_include_all=maven_include_all)
+    insert.make_create()
+    insert.execute()
 
     if parent_id:
         data = {'parent_id': parent_id,
@@ -2318,7 +2586,9 @@ def create_tag(name, parent=None, arches=None, perm=None, locked=False):
                 'intransitive': False,
                 'noconfig': False,
                 'pkg_filter': ''}
-        writeInheritanceData(get_tag(name)['id'],data)
+        writeInheritanceData(tag_id, data)
+
+    return tag_id
 
 def get_tag(tagInfo,strict=False,event=None):
     """Get tag information based on the tagInfo.  tagInfo may be either
@@ -2329,7 +2599,9 @@ def get_tag(tagInfo,strict=False,event=None):
     - name
     - perm_id (may be null)
     - arches (may be null)
-    - locked (may be null)
+    - locked
+    - maven_support
+    - maven_include_all
 
     If there is no tag matching the given tagInfo, and strict is False,
     return None.  If strict is True, raise a GenericError.
@@ -2338,7 +2610,7 @@ def get_tag(tagInfo,strict=False,event=None):
     in tag_config. A tag whose name appears in the tag table but has no
     active tag_config entry is considered deleted.
     """
-    fields = ('id', 'name', 'perm_id', 'arches', 'locked')
+    fields = ('id', 'name', 'perm_id', 'arches', 'locked', 'maven_support', 'maven_include_all')
     q = """SELECT %s FROM tag_config
     JOIN tag ON tag_config.tag_id = tag.id
     WHERE %s
@@ -2365,9 +2637,15 @@ def edit_tag(tagInfo, **kwargs):
         arches: change the arch list
         locked: lock or unlock the tag
         perm: change the permission requirement
+        maven_support: whether Maven repos should be generated for the tag
+        maven_include_all: include every build in this tag (including multiple
+                           versions of the same package) in the Maven repo
     """
 
     context.session.assertPerm('admin')
+    if not context.opts.get('EnableMaven') \
+                and dslice(kwargs, ['maven_support','maven_include_all'], strict=False):
+        raise koji.GenericError, "Maven support not enabled"
 
     tag = get_tag(tagInfo, strict=True)
     if kwargs.has_key('perm'):
@@ -2401,28 +2679,22 @@ def edit_tag(tagInfo, **kwargs):
     #check for changes
     data = tag.copy()
     changed = False
-    for key in ('perm_id','arches','locked'):
+    for key in ('perm_id','arches','locked','maven_support','maven_include_all'):
         if kwargs.has_key(key) and data[key] != kwargs[key]:
             changed = True
             data[key] = kwargs[key]
     if not changed:
         return
 
-    #use the same event for both
-    data['event_id'] = _singleValue("SELECT get_event()")
+    update = UpdateProcessor('tag_config', values=data, clauses=['tag_id = %(id)i'])
+    update.make_revoke()
+    update.execute()
 
-    update = """UPDATE tag_config
-    SET active = null,
-        revoke_event = %(event_id)i
-    WHERE tag_id = %(id)i
-      AND active is true"""
-    _dml(update, data)
-
-    insert = """INSERT INTO tag_config
-    (tag_id, arches, perm_id, locked, create_event)
-    VALUES
-    (%(id)i, %(arches)s, %(perm_id)s, %(locked)s, %(event_id)i)"""
-    _dml(insert, data)
+    insert = InsertProcessor('tag_config', data=dslice(data, ('arches', 'perm_id', 'locked')))
+    insert.set(tag_id=data['id'])
+    insert.set(**dslice(data, ('maven_support', 'maven_include_all')))
+    insert.make_create()
+    insert.execute()
 
 def old_edit_tag(tagInfo, name, arches, locked, permissionID):
     """Edit information for an existing tag."""
@@ -2437,29 +2709,28 @@ def delete_tag(tagInfo):
 
     #We do not ever DELETE tag data. It is versioned -- we revoke it instead.
 
-    def _tagDelete(tableName, value, event, columnName='tag_id'):
-        delete = """UPDATE %(tableName)s SET active=NULL,revoke_event=%%(event)i
-        WHERE %(columnName)s = %%(value)i AND active = TRUE""" % locals()
-        _dml(delete, locals())
+    def _tagDelete(tableName, value, columnName='tag_id'):
+        update = UpdateProcessor(tableName, clauses=["%s = %%(value)i" % columnName],
+                    values={'value':value})
+        update.make_revoke()
+        update.execute()
 
     tag = get_tag(tagInfo)
     tagID = tag['id']
-    #all these updates are a single transaction, so we use the same event
-    eventID = _singleValue("SELECT get_event()")
 
-    _tagDelete('tag_config', tagID, eventID)
+    _tagDelete('tag_config', tagID)
     #technically, to 'delete' the tag we only have to revoke the tag_config entry
     #these remaining revocations are more for cleanup.
-    _tagDelete('tag_inheritance', tagID, eventID)
-    _tagDelete('tag_inheritance', tagID, eventID, 'parent_id')
-    _tagDelete('build_target_config', tagID, eventID, 'build_tag')
-    _tagDelete('build_target_config', tagID, eventID, 'dest_tag')
-    _tagDelete('tag_listing', tagID, eventID)
-    _tagDelete('tag_packages', tagID, eventID)
-    _tagDelete('tag_external_repos', tagID, eventID)
-    _tagDelete('group_config', tagID, eventID)
-    _tagDelete('group_req_listing', tagID, eventID)
-    _tagDelete('group_package_listing', tagID, eventID)
+    _tagDelete('tag_inheritance', tagID)
+    _tagDelete('tag_inheritance', tagID, 'parent_id')
+    _tagDelete('build_target_config', tagID, 'build_tag')
+    _tagDelete('build_target_config', tagID, 'dest_tag')
+    _tagDelete('tag_listing', tagID)
+    _tagDelete('tag_packages', tagID)
+    _tagDelete('tag_external_repos', tagID)
+    _tagDelete('group_config', tagID)
+    _tagDelete('group_req_listing', tagID)
+    _tagDelete('group_package_listing', tagID)
     # note: we do not delete the entry in the tag table (we can't actually, it
     # is still referenced by the revoked rows).
     # note: there is no need to do anything with the repo entries that reference tagID
@@ -2483,8 +2754,10 @@ def create_external_repo(name, url):
         # Ensure the url always ends with /
         url += '/'
     values = {'id': id, 'name': name, 'url': url}
-    insert = """INSERT INTO external_repo_config (external_repo_id, url) VALUES (%(id)i, %(url)s)"""
-    _dml(insert, values)
+    insert = InsertProcessor('external_repo_config')
+    insert.set(external_repo_id = id, url=url)
+    insert.make_create()
+    insert.execute()
     return values
 
 def get_external_repos(info=None, url=None, event=None, queryOpts=None):
@@ -2547,20 +2820,17 @@ def edit_external_repo(info, name=None, url=None):
         if not url.endswith('/'):
             # Ensure the url always ends with /
             url += '/'
-        event_id = _singleValue("SELECT get_event()")
 
-        update = """UPDATE external_repo_config
-        SET active = NULL, revoke_event = %(event_id)i
-        WHERE external_repo_id = %(repo_id)i
-        AND active is true"""
+        update = UpdateProcessor('external_repo_config', values=locals(),
+                    clauses=['external_repo_id = %(repo_id)i'])
+        update.make_revoke()
 
-        insert = """INSERT INTO external_repo_config
-        (external_repo_id, url, create_event)
-        VALUES
-        (%(repo_id)i, %(url)s, %(event_id)i)"""
+        insert = InsertProcessor('external_repo_config')
+        insert.set(external_repo_id=repo_id, url=url)
+        insert.make_create()
 
-        _dml(update, locals())
-        _dml(insert, locals())
+        update.execute()
+        insert.execute()
 
 def delete_external_repo(info):
     """Delete an external repo"""
@@ -2574,14 +2844,12 @@ def delete_external_repo(info):
         remove_external_repo_from_tag(tag_info=tag_repo['tag_id'],
                                       repo_info=repo_id)
 
-    update = """UPDATE external_repo_config
-    SET active = null, revoke_event = get_event()
-    WHERE external_repo_id = %(repo_id)i
-    AND active = true"""
+    update = UpdateProcessor('external_repo_config', values=locals(),
+                    clauses=['external_repo_id = %(repo_id)i'])
+    update.make_revoke()
+    update.execute()
 
-    _dml(update, locals())
-
-def add_external_repo_to_tag(tag_info, repo_info, priority, event=None):
+def add_external_repo_to_tag(tag_info, repo_info, priority):
     """Add an external repo to a tag"""
 
     context.session.assertPerm('admin')
@@ -2599,19 +2867,12 @@ def add_external_repo_to_tag(tag_info, repo_info, priority, event=None):
         raise koji.GenericError, 'tag %s already associated with an external repo at priority %i' % \
             (tag['name'], priority)
 
-    if event is None:
-        event_id = _singleValue("SELECT get_event()")
-    else:
-        event_id = event
+    insert = InsertProcessor('tag_external_repos')
+    insert.set(tag_id=tag_id, external_repo_id=repo_id, priority=priority)
+    insert.make_create()
+    insert.execute()
 
-    insert = """INSERT INTO tag_external_repos
-    (tag_id, external_repo_id, priority, create_event)
-    VALUES
-    (%(tag_id)i, %(repo_id)i, %(priority)i, %(event_id)i)"""
-
-    _dml(insert, locals())
-
-def remove_external_repo_from_tag(tag_info, repo_info, event=None):
+def remove_external_repo_from_tag(tag_info, repo_info):
     """Remove an external repo from a tag"""
 
     context.session.assertPerm('admin')
@@ -2625,17 +2886,10 @@ def remove_external_repo_from_tag(tag_info, repo_info, event=None):
         raise koji.GenericError, 'external repo %s not associated with tag %s' % \
             (repo['name'], tag['name'])
 
-    if event is None:
-        event_id = _singleValue("SELECT get_event()")
-    else:
-        event_id = event
-
-    update = """UPDATE tag_external_repos
-    SET active = null, revoke_event=%(event_id)i
-    WHERE tag_id = %(tag_id)i AND external_repo_id = %(repo_id)i
-    AND active = true"""
-
-    _dml(update, locals())
+    update = UpdateProcessor('tag_external_repos', values=locals(),
+                clauses=["tag_id = %(tag_id)i", "external_repo_id = %(repo_id)i"])
+    update.make_revoke()
+    update.execute()
 
 def edit_tag_external_repo(tag_info, repo_info, priority):
     """Edit a tag<->external repo association
@@ -2655,9 +2909,8 @@ def edit_tag_external_repo(tag_info, repo_info, priority):
     tag_repo = tag_repos[0]
 
     if priority != tag_repo['priority']:
-        event_id = _singleValue("SELECT get_event()")
-        remove_external_repo_from_tag(tag_id, repo_id, event=event_id)
-        add_external_repo_to_tag(tag_id, repo_id, priority, event=event_id)
+        remove_external_repo_from_tag(tag_id, repo_id)
+        add_external_repo_to_tag(tag_id, repo_id, priority)
 
 def get_tag_external_repos(tag_info=None, repo_info=None, event=None):
     """
@@ -2929,6 +3182,340 @@ def get_rpm(rpminfo, strict=False, multi=False):
         return None
     return ret
 
+def list_rpms(buildID=None, buildrootID=None, imageID=None, componentBuildrootID=None, hostID=None, arches=None, queryOpts=None):
+    """List RPMS.  If buildID, imageID and/or buildrootID are specified,
+    restrict the list of RPMs to only those RPMs that are part of that
+    build, or were built in that buildroot.  If componentBuildrootID is specified,
+    restrict the list to only those RPMs that will get pulled into that buildroot
+    when it is used to build another package.  A list of maps is returned, each map
+    containing the following keys:
+
+    - id
+    - name
+    - version
+    - release
+    - nvr (synthesized for sorting purposes)
+    - arch
+    - epoch
+    - payloadhash
+    - size
+    - buildtime
+    - build_id
+    - buildroot_id
+    - external_repo_id
+    - external_repo_name
+
+    If componentBuildrootID is specified, two additional keys will be included:
+    - component_buildroot_id
+    - is_update
+
+    If no build has the given ID, or the build generated no RPMs,
+    an empty list is returned."""
+    fields = [('rpminfo.id', 'id'), ('rpminfo.name', 'name'), ('rpminfo.version', 'version'),
+              ('rpminfo.release', 'release'),
+              ("rpminfo.name || '-' || rpminfo.version || '-' || rpminfo.release", 'nvr'),
+              ('rpminfo.arch', 'arch'),
+              ('rpminfo.epoch', 'epoch'), ('rpminfo.payloadhash', 'payloadhash'),
+              ('rpminfo.size', 'size'), ('rpminfo.buildtime', 'buildtime'),
+              ('rpminfo.build_id', 'build_id'), ('rpminfo.buildroot_id', 'buildroot_id'),
+              ('rpminfo.external_repo_id', 'external_repo_id'),
+              ('external_repo.name', 'external_repo_name'),
+             ]
+    joins = ['external_repo ON rpminfo.external_repo_id = external_repo.id']
+    clauses = []
+
+    if buildID != None:
+        clauses.append('rpminfo.build_id = %(buildID)i')
+    if buildrootID != None:
+        clauses.append('rpminfo.buildroot_id = %(buildrootID)i')
+    if componentBuildrootID != None:
+        fields.append(('buildroot_listing.buildroot_id as component_buildroot_id',
+                       'component_buildroot_id'))
+        fields.append(('buildroot_listing.is_update', 'is_update'))
+        joins.append('buildroot_listing ON rpminfo.id = buildroot_listing.rpm_id')
+        clauses.append('buildroot_listing.buildroot_id = %(componentBuildrootID)i')
+
+    # image specific constraints
+    if imageID != None:
+       clauses.append('imageinfo_listing.image_id = %(imageID)i')
+       joins.append('imageinfo_listing ON rpminfo.id = imageinfo_listing.rpm_id')
+
+    if hostID != None:
+        joins.append('buildroot ON rpminfo.buildroot_id = buildroot.id')
+        clauses.append('buildroot.host_id = %(hostID)i')
+    if arches != None:
+        if isinstance(arches, list) or isinstance(arches, tuple):
+            clauses.append('rpminfo.arch IN %(arches)s')
+        elif isinstance(arches, str):
+            clauses.append('rpminfo.arch = %(arches)s')
+        else:
+            raise koji.GenericError, 'invalid type for "arches" parameter: %s' % type(arches)
+
+    query = QueryProcessor(columns=[f[0] for f in fields], aliases=[f[1] for f in fields],
+                           tables=['rpminfo'], joins=joins, clauses=clauses,
+                           values=locals(), opts=queryOpts)
+    return query.execute()
+
+def get_maven_build(buildInfo, strict=False):
+    """
+    Retrieve Maven-specific information about a build.
+    buildInfo can be either a string (n-v-r) or an integer
+    (build ID).
+    Returns a map containing the following keys:
+
+    build_id: id of the build (integer)
+    group_id: Maven groupId (string)
+    artifact_id: Maven artifact_Id (string)
+    version: Maven version (string)
+    """
+    fields = ('build_id', 'group_id', 'artifact_id', 'version')
+
+    build_id = find_build_id(buildInfo)
+    if not build_id:
+        if strict:
+            raise koji.GenericError, 'No matching build found: %s' % buildInfo
+        else:
+            return None
+    query = """SELECT %s
+    FROM maven_builds
+    WHERE build_id = %%(build_id)i""" % ', '.join(fields)
+    return _singleRow(query, locals(), fields, strict)
+
+def list_archives(buildID=None, buildrootID=None, componentBuildrootID=None, hostID=None, type=None,
+                  filename=None, size=None, md5sum=None, typeInfo=None, queryOpts=None):
+    """
+    Retrieve information about archives.
+    If buildID is not null it will restrict the list to archives built by the build with that ID.
+    If buildrootID is not null it will restrict the list to archives built in the buildroot with that ID.
+    If componentBuildrootID is not null it will restrict the list to archives that were present in the
+      buildroot with that ID.
+    If hostID is not null it will restrict the list to archives built on the host with that ID.
+    If filename, size, and/or md5sum are not null it will filter the results to entries matching the provided values.
+
+    Returns a list of maps containing the following keys:
+
+    id: unique id of the archive file (integer)
+    type_id: id of the archive type (Java jar, Solaris pkg, Windows exe, etc.) (integer)
+    type_name: name of the archive type
+    type_description: description of the archive
+    type_extensions: valid extensions for the type
+    build_id: id of the build that generated this archive (integer)
+    buildroot_id: id of the buildroot where this archive was built (integer)
+    filename: name of the archive (string)
+    size: size of the archive (integer)
+    md5sum: md5sum of the archive (string)
+
+    If componentBuildrootID is specified, then the map will also contain the following key:
+    project: whether the archive was pulled in as a project dependency, or as part of the 
+             build environment setup (boolean)
+
+    If 'type' is specified, then the archives listed will be limited
+    those associated with additional metadata of the given type.
+    Currently supported types are:
+
+    maven
+
+    If 'maven' is specified as a type, each returned map will contain
+    these additional keys:
+
+    group_id: Maven groupId (string)
+    artifact_id: Maven artifactId (string)
+    version: Maven version (string)
+
+    typeInfo is a dict that can be used to filter the output by type-specific info.
+    For the 'maven' type, this dict may contain one or more of group_id, artifact_id, or version,
+      and the output will be restricted to archives with matching attributes.
+
+    If there are no archives matching the selection criteria,
+    an empty list is returned.
+    """
+    values = {}
+    
+    tables = ['archiveinfo']
+    joins = ['archivetypes on archiveinfo.type_id = archivetypes.id']
+    columns = ['archiveinfo.id', 'archiveinfo.type_id', 'archiveinfo.build_id', 'archiveinfo.buildroot_id',
+               'archiveinfo.filename', 'archiveinfo.size', 'archiveinfo.md5sum',
+               'archivetypes.name', 'archivetypes.description', 'archivetypes.extensions']
+    aliases = ['id', 'type_id', 'build_id', 'buildroot_id', 'filename', 'size', 'md5sum',
+               'type_name', 'type_description', 'type_extensions']
+    clauses = []
+
+    if buildID is not None:
+        clauses.append('build_id = %(build_id)i')
+        values['build_id'] = buildID
+    if buildrootID is not None:
+        clauses.append('buildroot_id = %(buildroot_id)i')
+        values['buildroot_id'] = buildrootID
+    if componentBuildrootID is not None:
+        joins.append('buildroot_archives on archiveinfo.id = buildroot_archives.archive_id')
+        clauses.append('buildroot_archives.buildroot_id = %(component_buildroot_id)i')
+        values['component_buildroot_id'] = componentBuildrootID
+        columns.extend(['buildroot_archives.buildroot_id', 'buildroot_archives.project_dep'])
+        aliases.extend(['component_buildroot_id', 'project'])
+    if hostID is not None:
+        joins.append('buildroot on archiveinfo.buildroot_id = buildroot.id')
+        clauses.append('buildroot.host_id = %(host_id)i')
+        values['host_id'] = hostID
+        columns.append('buildroot.host_id')
+        aliases.append('host_id')
+    if filename is not None:
+        clauses.append('filename = %(filename)s')
+        values['filename'] = filename
+    if size is not None:
+        clauses.append('size = %(size)i')
+        values['size'] = size
+    if md5sum is not None:
+        clauses.append('md5sum = %(md5sum)s')
+        values['md5sum'] = md5sum
+
+    if type is None:
+        pass
+    elif type == 'maven':
+        joins.append('maven_archives ON archiveinfo.id = maven_archives.archive_id')
+        columns.extend(['maven_archives.group_id', 'maven_archives.artifact_id', 'maven_archives.version'])
+        aliases.extend(['group_id', 'artifact_id', 'version'])
+
+        if typeInfo:
+            for key in ('group_id', 'artifact_id', 'version'):
+                if typeInfo.has_key(key):
+                    clauses.append('maven_archives.%s = %%(%s)s' % (key, key))
+                    values[key] = typeInfo[key]
+    else:
+        raise koji.GenericError, 'unsupported archive type: %s' % type
+
+    return QueryProcessor(tables=tables, columns=columns, aliases=aliases, joins=joins,
+                          clauses=clauses, values=values, opts=queryOpts).execute()
+
+def get_archive(archive_id, strict=False):
+    """
+    Get information about the archive with the given ID.  Returns a map
+    containing the following keys:
+
+    id: unique id of the archive file (integer)
+    type_id: id of the archive type (Java jar, Solaris pkg, Windows exe, etc.) (integer)
+    build_id: id of the build that generated this archive (integer)
+    buildroot_id: id of the buildroot where this archive was built (integer)
+    filename: name of the archive (string)
+    size: size of the archive (integer)
+    md5sum: md5sum of the archive (string)
+    """
+    fields = ('id', 'type_id', 'build_id', 'buildroot_id', 'filename', 'size', 'md5sum')
+    select = """SELECT %s FROM archiveinfo
+    WHERE id = %%(archive_id)i""" % ', '.join(fields)
+    return _singleRow(select, locals(), fields, strict=strict)
+
+def get_maven_archive(archive_id):
+    """
+    Retrieve Maven-specific information about an archive.
+    Returns a map containing the following keys:
+
+    archive_id: id of the build (integer)
+    group_id: Maven groupId (string)
+    artifact_id: Maven artifact_Id (string)
+    version: Maven version (string)
+    """
+    fields = ('archive_id', 'group_id', 'artifact_id', 'version')
+    select = """SELECT %s FROM maven_archives
+    WHERE archive_id = %%(archive_id)i""" % ', '.join(fields)
+    return _singleRow(select, locals(), fields)
+
+def _get_zipfile_list(archive_id, zippath):
+    """
+    Get a list of the entries in the zipfile located at zippath.
+    Return a list of dicts, one per entry in the zipfile.  Each dict contains:
+     - archive_id
+     - name
+     - size
+    If the file does not exist, return an empty list.
+    """
+    result = []
+    if not os.path.exists(zippath):
+        return result
+    archive = zipfile.ZipFile(zippath, 'r')
+    for entry in archive.infolist():
+        filename = koji.fixEncoding(entry.filename)
+        result.append({'archive_id': archive_id,
+                       'name': filename,
+                       'size': entry.file_size,
+                       'mtime': int(time.mktime(entry.date_time + (0, 0, -1)))})
+    archive.close()
+    return result
+
+def _get_tarball_list(archive_id, tarpath):
+    """
+    Get a list of the entries in the tarball located at tarpath.
+    Return a list of dicts, one per entry in the tarball.  Each dict contains:
+     - archive_id
+     - name
+     - size
+     - mtime
+     - mode
+     - user
+     - group
+    If the file does not exist, return an empty list.
+    """
+    result = []
+    if not os.path.exists(tarpath):
+        return result
+    archive = tarfile.open(tarpath, 'r')
+    for entry in archive:
+        filename = koji.fixEncoding(entry.name)
+        result.append({'archive_id': archive_id,
+                       'name': filename,
+                       'size': entry.size,
+                       'mtime': entry.mtime,
+                       'mode': entry.mode,
+                       'user': entry.uname,
+                       'group': entry.gname})
+    archive.close()
+    return result
+
+def list_archive_files(archive_id, queryOpts=None):
+    """
+    Get information about the files contained in the archive with the given ID.
+    Returns a list of maps with with following keys:
+
+    archive_id: id of the archive the file is contained in (integer)
+    name: name of the file (string)
+    size: uncompressed size of the file (integer)
+    """
+    archive_info = get_archive(archive_id, strict=True)
+
+    archive_type = get_archive_type(type_id=archive_info['type_id'], strict=True)
+    build_info = get_build(archive_info['build_id'], strict=True)
+    maven_info = get_maven_build(build_info['id'])
+    if not maven_info:
+        # XXX support other archive types, when they exist
+        return _applyQueryOpts([], queryOpts)
+
+    file_path = os.path.join(koji.pathinfo.mavenbuild(build_info, maven_info),
+                             archive_info['filename'])
+
+    if archive_type['name'] in ('zip', 'jar'):
+        return _applyQueryOpts(_get_zipfile_list(archive_id, file_path), queryOpts)
+    elif archive_type['name'] == 'tar':
+        return _applyQueryOpts(_get_tarball_list(archive_id, file_path), queryOpts)
+    else:
+        # XXX support other archive types
+        return _applyQueryOpts([], queryOpts)
+
+def get_archive_file(archive_id, filename):
+    """
+    Get information about a file with the given filename
+    contained in the archive with the given ID.
+    Returns a map with with following keys:
+
+    archive_id: id of the archive the file is contained in (integer)
+    name: name of the file (string)
+    size: uncompressed size of the file (integer)
+    """
+    files = list_archive_files(archive_id)
+    for file_info in files:
+        if file_info['name'] == filename:
+            return file_info
+    else:
+        return None
+
 def _fetchMulti(query, values):
     """Run the query and return all rows"""
     c = context.cnx.cursor()
@@ -2998,6 +3585,7 @@ def _dml(operation, values):
     c = context.cnx.cursor()
     c.execute(operation, values)
     ret = c.rowcount
+    logger.debug("Operation affected %s row(s)", ret)
     c.close()
     context.commit_pending = True
     return ret
@@ -3082,7 +3670,7 @@ def get_channel(channelInfo, strict=False):
     return _singleRow(query, locals(), fields, strict)
 
 
-def query_buildroots(hostID=None, tagID=None, state=None, rpmID=None, taskID=None, buildrootID=None, queryOpts=None):
+def query_buildroots(hostID=None, tagID=None, state=None, rpmID=None, archiveID=None, taskID=None, buildrootID=None, queryOpts=None):
     """Return a list of matching buildroots
 
     Optional args:
@@ -3130,6 +3718,9 @@ def query_buildroots(hostID=None, tagID=None, state=None, rpmID=None, taskID=Non
         joins.insert(0, 'buildroot_listing ON buildroot.id = buildroot_listing.buildroot_id')
         fields.append(('buildroot_listing.is_update', 'is_update'))
         clauses.append('buildroot_listing.rpm_id = %(rpmID)i')
+    if archiveID != None:
+        joins.append('buildroot_archives ON buildroot.id = buildroot_archives.buildroot_id')
+        clauses.append('buildroot_archives.archive_id = %(archiveID)i')
     if taskID != None:
         clauses.append('buildroot.task_id = %(taskID)i')
 
@@ -3347,7 +3938,7 @@ def import_build(srpm, rpms, brmap=None, task_id=None, build_id=None, logs=None)
                               task_id=task_id, build_id=build_id, build=binfo, logs=logs)
     return build
 
-def import_rpm(fn,buildinfo=None,brootid=None):
+def import_rpm(fn,buildinfo=None,brootid=None,wrapper=False):
     """Import a single rpm into the database
 
     Designed to be called from import_build.
@@ -3390,7 +3981,8 @@ def import_rpm(fn,buildinfo=None,brootid=None):
             if state in ('FAILED', 'CANCELED', 'DELETED'):
                 nvr = "%(name)s-%(version)s-%(release)s" % buildinfo
                 raise koji.GenericError, "Build is %s: %s" % (state, nvr)
-    else:
+    elif not wrapper:
+        # only enforce the srpm name matching the build for non-wrapper rpms
         srpmname = "%(name)s-%(version)s-%(release)s.src.rpm" % buildinfo
         #either the sourcerpm field should match the build, or the filename
         #itself (for the srpm)
@@ -3511,13 +4103,7 @@ def import_rpm_file(fn,buildinfo,rpminfo):
     Generally this is done after the db import
     """
     final_path = "%s/%s" % (koji.pathinfo.build(buildinfo),koji.pathinfo.rpm(rpminfo))
-    koji.ensuredir(os.path.dirname(final_path))
-    if os.path.exists(final_path):
-        raise koji.GenericError("Error importing RPM file. %s already exists." % final_path)
-    if os.path.islink(fn) or not os.path.isfile(fn):
-        raise koji.GenericError("Error importing RPM file. %s is not a regular file." % fn)
-    os.rename(fn,final_path)
-    os.symlink(final_path,fn)
+    _import_archive_file(fn, os.path.dirname(final_path))
 
 def import_build_in_place(build):
     """Import a package already in the packages directory
@@ -3592,6 +4178,224 @@ def import_build_in_place(build):
     koji.plugin.run_callbacks('postBuildStateChange', attribute='state', old=buildinfo['state'], new=st_complete, info=buildinfo)
     koji.plugin.run_callbacks('postImport', type='build', in_place=True, srpm=srpm, rpms=rpms)
     return build_id
+
+def _import_wrapper(task_id, build_info, rpm_results):
+    """Helper function to import wrapper rpms for a Maven build"""
+    rpm_buildroot_id = rpm_results['buildroot_id']
+    rpm_task_dir = koji.pathinfo.task(task_id)
+
+    for rpm_path in [rpm_results['srpm']] + rpm_results['rpms']:
+        rpm_path = os.path.join(rpm_task_dir, rpm_path)
+        rpm_info = import_rpm(rpm_path, build_info, rpm_buildroot_id, wrapper=True)
+        import_rpm_file(rpm_path, build_info, rpm_info)
+        add_rpm_sig(rpm_info['id'], koji.rip_rpm_sighdr(rpm_path))
+
+    for log in rpm_results['logs']:
+        # assume we're only importing noarch packages
+        import_build_log(os.path.join(rpm_task_dir, log),
+                         build_info, subdir='noarch')
+
+def get_archive_types():
+    """Return a list of all supported archivetypes"""
+    select = """SELECT id, name, description, extensions FROM archivetypes
+    ORDER BY id"""
+    return _multiRow(select, {}, ('id', 'name', 'description', 'extensions'))
+
+def _get_archive_type_by_name(name, strict=True):
+    select = """SELECT id, name, description, extensions FROM archivetypes
+    WHERE name = %(name)s"""
+    return _singleRow(select, locals(), ('id', 'name', 'description', 'extensions'), strict)
+
+def _get_archive_type_by_id(type_id, strict=False):
+    select = """SELECT id, name, description, extensions FROM archivetypes
+    WHERE id = %(type_id)i"""
+    return _singleRow(select, locals(), ('id', 'name', 'description', 'extensions'), strict)
+
+def get_archive_type(filename=None, type_name=None, type_id=None, strict=False):
+    """
+    Get the archive type for the given filename, type_name, or type_id.
+    """
+    if type_id:
+        return _get_archive_type_by_id(type_id, strict)
+    elif type_name:
+        return _get_archive_type_by_name(type_name, strict)
+    elif filename:
+        # we handle that below
+        pass
+    else:
+        raise koji.GenericError, 'one of filename, type_name, or type_id must be specified'
+
+    parts = filename.split('.')
+
+    for start in range(len(parts)-1, -1, -1):
+        ext = '.'.join(parts[start:])
+
+        select = r"""SELECT id, name, description, extensions FROM archivetypes
+                      WHERE extensions ~ E'\\m%s\\M'""" % ext
+        results = _multiRow(select, locals(), ('id', 'name', 'description', 'extensions'))
+
+        if len(results) == 1:
+            return results[0]
+        elif len(results) > 1:
+            # this should never happen, and is a misconfiguration in the database
+            raise koji.GenericError, 'multiple matches for file extension: %s' % ext
+    else:
+        if strict:
+            raise koji.GenericError, 'unsupported file extension: %s' % ext
+        else:
+            return None
+
+def new_maven_build(build, maven_info):
+    """
+    Add Maven metadata to an existing build.
+    maven_info must contain the 'group_id' and
+    'artifact_id' keys.
+
+    Note: the "group_id-artifact_id" must match the name of the build
+    """
+    maven_info = maven_info.copy()
+    maven_nvr = koji.maven_info_to_nvr(maven_info)
+    maven_nvr['release'] = build['release']
+
+    for field in ('name', 'version', 'epoch'):
+        if build[field] != maven_nvr[field]:
+            raise koji.BuildError, '%s mismatch (build: %s, maven: %s)' % \
+                (field, build[field], maven_nvr[field])
+
+    current_maven_info = get_maven_build(build)
+    if current_maven_info:
+        # already exists, verify that it matches
+        for field in ('group_id', 'artifact_id', 'version'):
+            if current_maven_info[field] != maven_info[field]:
+                raise koji.BuildError, '%s mismatch (current: %s, new: %s)' % \
+                    (field, current_maven_info[field], maven_info[field])
+    else:
+        maven_info['build_id'] = build['id']
+        insert = """INSERT INTO maven_builds (build_id, group_id, artifact_id, version)
+                    VALUES (%(build_id)i, %(group_id)s, %(artifact_id)s, %(version)s)"""
+        _dml(insert, maven_info)
+
+def import_archive(filepath, buildinfo, type, typeInfo, buildroot_id=None):
+    """
+    Import an archive file and associate it with a build.  The archive can
+    be any non-rpm filetype supported by Koji.
+
+    filepath: full path to the archive file
+    buildinfo: dict of information about the build to associate the archive with (as returned by getBuild())
+    type: type of the archive being imported.  Currently supported archive types: maven
+    typeInfo: dict of type-specific information
+    buildroot_id: the id of the buildroot the archive was built in (may be null)
+    """
+    if not os.path.exists(filepath):
+        raise koji.GenericError, 'no such file: %s' % filepath
+
+    filename = koji.fixEncoding(os.path.basename(filepath))
+    archivetype = get_archive_type(filename, strict=True)
+    type_id = archivetype['id']
+    build_id = buildinfo['id']
+    size = os.path.getsize(filepath)
+    archivefp = file(filepath)
+    m = md5_constructor()
+    while True:
+        contents = archivefp.read(8192)
+        if not contents:
+            break
+        m.update(contents)
+    archivefp.close()
+    md5sum = m.hexdigest()
+
+    # XXX verify that the buildroot is associated with a task that's associated with the build
+    archive_id = _singleValue("SELECT nextval('archiveinfo_id_seq')", strict=True)
+    insert = """INSERT INTO archiveinfo
+    (id, type_id, build_id, buildroot_id, filename, size, md5sum)
+    VALUES
+    (%(archive_id)i, %(type_id)i, %(build_id)i, %(buildroot_id)s, %(filename)s, %(size)i, %(md5sum)s)"""
+    _dml(insert, locals())
+
+    if type == 'maven':
+        maveninfo = get_maven_build(buildinfo, strict=True)
+        mavendir = koji.pathinfo.mavenbuild(buildinfo, maveninfo)
+
+        if archivetype['name'] == 'pom':
+            pom_info = koji.parse_pom(filepath)
+            pom_maveninfo = koji.pom_to_maven_info(pom_info)
+            # sanity check: Maven info from pom must match the user-supplied typeInfo
+            if koji.mavenLabel(pom_maveninfo) != koji.mavenLabel(typeInfo):
+                raise koji.BuildError, 'Maven info from .pom file (%s) does not match user-supplied typeInfo (%s)' % \
+                    (koji.mavenLabel(pom_maveninfo), koji.mavenLabel(typeInfo))
+
+        _insert_maven_archive(archive_id, typeInfo)
+        # move the file to it's final destination
+        _import_archive_file(filepath, mavendir)
+        _generate_maven_metadata(maveninfo, mavendir)
+    else:
+        raise koji.BuildError, 'unsupported archive type: %s' % type
+
+def _insert_maven_archive(archive_id, mavendata):
+    """Associate the Maven data with the given archive"""
+    mavendata = mavendata.copy()
+    mavendata['archive_id'] = archive_id
+    insert = """INSERT INTO maven_archives (archive_id, group_id, artifact_id, version)
+        VALUES (%(archive_id)i, %(group_id)s, %(artifact_id)s, %(version)s)"""
+    _dml(insert, mavendata)
+
+def _import_archive_file(filepath, destdir):
+    """
+    Move the file to it's final location on the filesystem.
+    filepath must exist, destdir will be created if it doesn not exist.
+    A symlink pointing from the old location to the new location will
+    be created.
+    """
+    final_path = "%s/%s" % (destdir,
+                            koji.fixEncoding(os.path.basename(filepath)))
+    if os.path.exists(final_path):
+        raise koji.GenericError("Error importing archive file, %s already exists" % final_path)
+    if os.path.islink(filepath) or not os.path.isfile(filepath):
+        raise koji.GenericError("Error importing archive file, %s is not a regular file" % filepath)
+    koji.ensuredir(destdir)
+    os.rename(filepath, final_path)
+    os.symlink(final_path, filepath)
+
+def _generate_maven_metadata(maveninfo, mavendir, contents=None):
+    """
+    Generate md5 and sha1 sums for every file in mavendir, if it doesn't already exist.
+    Checksum files will be named <filename>.md5 and <filename>.sha1.
+    """
+    metadata_filename = '%s/maven-metadata.xml' % mavendir
+    if not os.path.exists(metadata_filename):
+        if not contents:
+            contents = """<?xml version="1.0" encoding="UTF-8"?>
+<metadata>
+  <groupId>%(group_id)s</groupId>
+  <artifactId>%(artifact_id)s</artifactId>
+  <version>%(version)s</version>
+</metadata>
+"""
+        contents = contents % maveninfo
+        metadata_file = file(metadata_filename, 'w')
+        metadata_file.write(contents)
+        metadata_file.close()
+        
+    mavenfiles = os.listdir(mavendir)
+    for mavenfile in mavenfiles:
+        if os.path.splitext(mavenfile)[1] in ('.md5', '.sha1'):
+            continue
+        if not os.path.isfile('%s/%s' % (mavendir, mavenfile)):
+            continue
+        for ext, sum_constr in (('.md5', md5_constructor), ('.sha1', sha1_constructor)):
+            sumfile = mavenfile + ext
+            if sumfile not in mavenfiles:
+                sum = sum_constr()
+                fobj = file('%s/%s' % (mavendir, mavenfile))
+                while True:
+                    content = fobj.read(8192)
+                    if not content:
+                        break
+                    sum.update(content)
+                fobj.close()
+                sumobj = file('%s/%s' % (mavendir, sumfile), 'w')
+                sumobj.write(sum.hexdigest())
+                sumobj.close()
 
 def add_rpm_sig(an_rpm, sighdr):
     """Store a signature header for an rpm"""
@@ -3778,10 +4582,14 @@ def tag_history(build=None, tag=None, package=None, queryOpts=None):
     fields = ('build.id', 'package.name', 'build.version', 'build.release',
               'tag.id', 'tag.name', 'tag_listing.active',
               'tag_listing.create_event', 'tag_listing.revoke_event',
+              'tag_listing.creator_id', 'tag_listing.revoker_id',
+              'creator.name', 'revoker.name',
               'EXTRACT(EPOCH FROM ev1.time)', 'EXTRACT(EPOCH FROM ev2.time)',)
     aliases = ('build_id', 'name', 'version', 'release',
               'tag_id', 'tag_name', 'active',
               'create_event', 'revoke_event',
+              'creator_id', 'revoker_id',
+              'creator_name', 'revoker_name',
               'create_ts', 'revoke_ts',)
     st_complete = koji.BUILD_STATES['COMPLETE']
     tables = ['tag_listing']
@@ -3789,7 +4597,9 @@ def tag_history(build=None, tag=None, package=None, queryOpts=None):
              "build ON build.id = tag_listing.build_id",
              "package ON package.id = build.pkg_id",
              "events AS ev1 ON ev1.id = tag_listing.create_event",
-             "LEFT OUTER JOIN events AS ev2 ON ev2.id = tag_listing.revoke_event", ]
+             "LEFT OUTER JOIN events AS ev2 ON ev2.id = tag_listing.revoke_event",
+             "users AS creator ON creator.id = tag_listing.creator_id",
+             "LEFT OUTER JOIN users AS revoker ON revoker.id = tag_listing.revoker_id", ]
     clauses = []
     if tag is not None:
         tag_id = get_tag_id(tag, strict=True)
@@ -3858,6 +4668,7 @@ def build_references(build_id, limit=None):
     #references (that matter):
     #   tag_listing
     #   buildroot_listing (via rpminfo)
+    #   buildroot_archives (via archiveinfo)
     #   ?? rpmsigs (via rpminfo)
     ret = {}
 
@@ -3889,6 +4700,27 @@ def build_references(build_id, limit=None):
             break
     ret['rpms'] = idx.values()
 
+    # find archives whose buildroots we were in
+    q = """SELECT id FROM archiveinfo WHERE build_id = %(build_id)i"""
+    archive_ids = _fetchMulti(q, locals())
+    fields = ('id', 'type_id', 'type_name', 'build_id', 'filename')
+    idx = {}
+    q = """SELECT archiveinfo.id, archiveinfo.type_id, archivetypes.name, archiveinfo.build_id, archiveinfo.filename
+    FROM buildroot_archives
+        JOIN archiveinfo ON archiveinfo.buildroot_id = buildroot_archives.buildroot_id
+        JOIN build ON archiveinfo.build_id = build.id
+        JOIN archivetypes ON archivetypes.id = archiveinfo.type_id
+    WHERE buildroot_archives.archive_id = %(archive_id)i
+        AND build.state = %(st_complete)i"""
+    if limit is not None:
+        q += "\nLIMIT %(limit)i"
+    for (archive_id,) in archive_ids:
+        for row in _multiRow(q, locals(), fields):
+            idx.setdefault(row['id'], row)
+        if limit is not None and len(idx) > limit:
+            break
+    ret['archives'] = idx.values()
+
     # find timestamp of most recent use in a buildroot
     q = """SELECT buildroot.create_event
     FROM buildroot_listing
@@ -3906,6 +4738,26 @@ def build_references(build_id, limit=None):
     else:
         q = """SELECT EXTRACT(EPOCH FROM get_event_time(%(event_id)i))"""
         ret['last_used'] = _singleValue(q, locals())
+
+    q = """SELECT buildroot.create_event
+    FROM buildroot_archives
+        JOIN buildroot ON buildroot_archives.buildroot_id = buildroot.id
+    WHERE buildroot_archives.archive_id = %(archive_id)i
+    ORDER BY buildroot.create_event DESC
+    LIMIT 1"""
+    event_id = -1
+    for (archive_id,) in archive_ids:
+        tmp_id = _singleValue(q, locals(), strict=False)
+        if tmp_id is not None and tmp_id > event_id:
+            event_id = tmp_id
+    if event_id == -1:
+        pass
+    else:
+        q = """SELECT EXTRACT(EPOCH FROM get_event_time(%(event_id)i))"""
+        last_archive_use = _singleValue(q, locals())
+        if ret['last_used'] is None or last_archive_use > ret['last_used']:
+            ret['last_used'] = last_archive_use
+
     return ret
 
 def delete_build(build, strict=True, min_ref_age=604800):
@@ -3936,6 +4788,10 @@ def delete_build(build, strict=True, min_ref_age=604800):
         if strict:
             raise koji.GenericError, "Cannot delete build, used in buildroots: %s" % refs['rpms']
         return False
+    if refs['archives']:
+        if strict:
+            raise koji.GenericError, "Cannot delete build, used in archive buildroots: %s" % refs['archives']
+        return False
     if refs['last_used']:
         age = time.time() - refs['last_used']
         if age < min_ref_age:
@@ -3953,11 +4809,14 @@ def _delete_build(binfo):
     """
     # build-related data:
     #   build   KEEP (marked deleted)
+    #   maven_builds KEEP
     #   task ??
     #   tag_listing REVOKE (versioned) (but should ideally be empty anyway)
     #   rpminfo KEEP
     #           buildroot_listing KEEP (but should ideally be empty anyway)
     #           rpmsigs DELETE
+    #   archiveinfo KEEP
+    #               buildroot_archives KEEP (but should ideally be empty anyway)
     #   files on disk: DELETE
     st_deleted = koji.BUILD_STATES['DELETED']
     koji.plugin.run_callbacks('preBuildStateChange', attribute='state', old=binfo['state'], new=st_deleted, info=binfo)
@@ -3967,19 +4826,29 @@ def _delete_build(binfo):
     for (rpm_id,) in rpm_ids:
         delete = """DELETE FROM rpmsigs WHERE rpm_id=%(rpm_id)i"""
         _dml(delete, locals())
-    event_id = _singleValue("SELECT get_event()")
-    update = """UPDATE tag_listing SET revoke_event=%(event_id)i, active=NULL
-    WHERE active = TRUE AND build_id=%(build_id)i"""
-    _dml(update, locals())
+    update = UpdateProcessor('tag_listing', clauses=["build_id=%(build_id)i"], values=locals())
+    update.make_revoke()
+    update.execute()
     update = """UPDATE build SET state=%(st_deleted)i WHERE id=%(build_id)i"""
     _dml(update, locals())
-    #now clear the build dir
+    #now clear the build dirs
+    dirs_to_clear = []
     builddir = koji.pathinfo.build(binfo)
-    rv = os.system(r"find '%s' -xdev \! -type d -print0 |xargs -0 rm -f" % builddir)
-    if rv != 0:
-        raise koji.GenericError, 'file removal failed (code %r) for %s' % (rv, builddir)
-    #and clear out the emptied dirs
-    os.system(r"find '%s' -xdev -depth -type d -print0 |xargs -0 rmdir" % builddir)
+    if os.path.exists(builddir):
+        dirs_to_clear.append(builddir)
+    maven_info = get_maven_build(build_id)
+    if maven_info:
+        mavendir = koji.pathinfo.mavenbuild(binfo, maven_info)
+        if os.path.exists(mavendir):
+            dirs_to_clear.append(mavendir)
+    for filedir in dirs_to_clear:
+        rv = os.system(r"find '%s' -xdev \! -type d -print0 |xargs -0 rm -f" % filedir)
+        if rv != 0:
+            raise koji.GenericError, 'file removal failed (code %r) for %s' % (rv, filedir)
+        #and clear out the emptied dirs
+        rv = os.system(r"find '%s' -xdev -depth -type d -print0 |xargs -0 rmdir" % filedir)
+        if rv != 0:
+            raise koji.GenericError, 'directory removal failed (code %r) for %s' % (rv, filedir)
     koji.plugin.run_callbacks('postBuildStateChange', attribute='state', old=binfo['state'], new=st_deleted, info=binfo)
 
 def reset_build(build):
@@ -3990,6 +4859,8 @@ def reset_build(build):
     sets state to CANCELED
     clears data in rpminfo
     removes rpminfo entries from any buildroot_listings [!]
+    clears data in archiveinfo, maven_info
+    removes archiveinfo entries from buildroot_archives
     remove files related to the build
 
     note, we don't actually delete the build data, so tags
@@ -4001,6 +4872,7 @@ def reset_build(build):
     if not binfo:
         #nothing to do
         return
+    minfo = get_maven_build(binfo)
     koji.plugin.run_callbacks('preBuildStateChange', attribute='state', old=binfo['state'], new=koji.BUILD_STATES['CANCELED'], info=binfo)
     q = """SELECT id FROM rpminfo WHERE build_id=%(id)i"""
     ids = _fetchMulti(q, binfo)
@@ -4011,14 +4883,37 @@ def reset_build(build):
         _dml(delete, locals())
     delete = """DELETE FROM rpminfo WHERE build_id=%(id)i"""
     _dml(delete, binfo)
+    q = """SELECT id FROM archiveinfo WHERE build_id=%(id)i"""
+    ids = _fetchMulti(q, binfo)
+    for (archive_id,) in ids:
+        delete = """DELETE FROM maven_archives WHERE archive_id=%(archive_id)i"""
+        _dml(delete, locals())
+        delete = """DELETE FROM buildroot_archives WHERE archive_id=%(archive_id)i"""
+        _dml(delete, locals())
+    delete = """DELETE FROM archiveinfo WHERE build_id=%(id)i"""
+    _dml(delete, binfo)
+    delete = """DELETE FROM maven_builds WHERE build_id = %(id)i"""
+    _dml(delete, binfo)
     binfo['state'] = koji.BUILD_STATES['CANCELED']
     update = """UPDATE build SET state=%(state)i, task_id=NULL WHERE id=%(id)i"""
     _dml(update, binfo)
-    #now clear the build dir
+    #now clear the build dirs
+    dirs_to_clear = []
     builddir = koji.pathinfo.build(binfo)
-    rv = os.system("find '%s' -xdev \\! -type d -print0 |xargs -0 rm -f" % builddir)
-    if rv != 0:
-        raise koji.GenericError, 'file removal failed (code %r) for %s' % (rv, builddir)
+    if os.path.exists(builddir):
+        dirs_to_clear.append(builddir)
+    if minfo:
+        mavendir = koji.pathinfo.mavenbuild(binfo, minfo)
+        if os.path.exists(mavendir):
+            dirs_to_clear.append(mavendir)
+    for filedir in dirs_to_clear:
+        rv = os.system(r"find '%s' -xdev \! -type d -print0 |xargs -0 rm -f" % filedir)
+        if rv != 0:
+            raise koji.GenericError, 'file removal failed (code %r) for %s' % (rv, filedir)
+        #and clear out the emptied dirs
+        rv = os.system(r"find '%s' -xdev -depth -type d -print0 |xargs -0 rmdir" % filedir)
+        if rv != 0:
+            raise koji.GenericError, 'directory removal failed (code %r) for %s' % (rv, filedir)
     koji.plugin.run_callbacks('postBuildStateChange', attribute='state', old=binfo['state'], new=koji.BUILD_STATES['CANCELED'], info=binfo)
 
 def cancel_build(build_id, cancel_task=True):
@@ -4179,7 +5074,7 @@ def new_group(name):
         raise koji.GenericError, 'user/group already exists: %s' % name
     return context.session.createUser(name, usertype=koji.USERTYPES['GROUP'])
 
-def add_group_member(group,user):
+def add_group_member(group, user, strict=True):
     """Add user to group"""
     context.session.assertPerm('admin')
     group = get_user(group)
@@ -4189,19 +5084,20 @@ def add_group_member(group,user):
     if user['usertype'] == koji.USERTYPES['GROUP']:
         raise koji.GenericError, "Groups cannot be members of other groups"
     #check to see if user is already a member
-    user_id = user['id']
-    group_id = group['id']
-    q = """SELECT user_id FROM user_groups
-    WHERE active = TRUE AND user_id = %(user_id)i
-        AND group_id = %(group_id)s
-    FOR UPDATE"""
-    row = _fetchSingle(q, locals(), strict=False)
+    data = {'user_id' : user['id'], 'group_id' : group['id']}
+    table = 'user_groups'
+    clauses = ('user_id = %(user_id)i', 'group_id = %(group_id)s')
+    query = QueryProcessor(columns=['user_id'], tables=[table],
+                           clauses=('active = TRUE',)+clauses,
+                           values=data, opts={'rowlock':True})
+    row = query.executeOne()
     if row:
+        if not strict:
+            return
         raise koji.GenericError, "User already in group"
-    insert = """INSERT INTO user_groups (user_id,group_id)
-    VALUES(%(user_id)i,%(group_id)i)"""
-    _dml(insert,locals())
-
+    insert = InsertProcessor(table, data)
+    insert.make_create()
+    insert.execute()
 
 def drop_group_member(group,user):
     """Drop user from group"""
@@ -4212,11 +5108,9 @@ def drop_group_member(group,user):
         raise koji.GenericError, "Not a group: %(name)s" % group
     user_id = user['id']
     group_id = group['id']
-    insert = """UPDATE user_groups
-    SET active=NULL, revoke_event=get_event()
-    WHERE active = TRUE AND user_id = %(user_id)i
-        AND group_id = %(group_id)i"""
-    _dml(insert,locals())
+    update = UpdateProcessor('user_groups', clauses=["user_id = %(user_id)i", "group_id = %(group_id)i"])
+    update.make_revoke()
+    update.execute()
 
 def get_group_members(group):
     """Get the members of a group"""
@@ -4245,6 +5139,155 @@ def set_user_status(user, status):
     if rows == 0:
         raise koji.GenericError, 'invalid user ID: %i' % user_id
 
+
+def get_event():
+    """Get an event id for this transaction
+
+    We cache the result in context, so subsequent calls in the same transaction will
+    get the same event.
+    Note that this will persist across calls in a multiCall, which is fine because
+    it is all one transaction.
+    """
+    if hasattr(context, 'event_id'):
+        return context.event_id
+    event_id = _singleValue("SELECT get_event()")
+    context.event_id = event_id
+    return event_id
+
+
+class InsertProcessor(object):
+    """Build an insert statement
+
+    table - the table to insert into
+    data - a dictionary of data to insert (keys = row names)
+    rawdata - data to insert specified as sql expressions rather than python values
+
+    does not support query inserts of "DEFAULT VALUES"
+    """
+
+    def __init__(self, table, data=None, rawdata=None):
+        self.table = table
+        self.data = {}
+        if data:
+            self.data.update(data)
+        self.rawdata = {}
+        if rawdata:
+            self.rawdata.update(rawdata)
+
+    def __str__(self):
+        if not self.data and not self.rawdata:
+            return "-- incomplete update: no assigns"
+        parts = ['INSERT INTO %s ' % self.table]
+        columns = self.data.keys()
+        columns.extend(self.rawdata.keys())
+        parts.append("(%s) " % ', '.join(columns))
+        values = []
+        for key in columns:
+            if self.data.has_key(key):
+                values.append("%%(%s)s" % key)
+            else:
+                values.append("(%s)" % self.rawdata[key])
+        parts.append("VALUES (%s)" % ', '.join(values))
+        return ''.join(parts)
+
+    def __repr__(self):
+        return "<InsertProcessor: %r>" % vars(self)
+
+    def set(self, **kwargs):
+        """Set data via keyword args"""
+        self.data.update(kwargs)
+
+    def rawset(self, **kwargs):
+        """Set rawdata via keyword args"""
+        self.rawdata.update(kwargs)
+
+    def make_create(self, event_id=None, user_id=None):
+        if event_id is None:
+            event_id = get_event()
+        if user_id is None:
+            context.session.assertLogin()
+            user_id = context.session.user_id
+        self.data['create_event'] = event_id
+        self.data['creator_id'] = user_id
+
+    def execute(self):
+        return _dml(str(self), self.data)
+
+
+class UpdateProcessor(object):
+    """Build an update statement
+
+    table - the table to insert into
+    data - a dictionary of data to insert (keys = row names)
+    rawdata - data to insert specified as sql expressions rather than python values
+    clauses - a list of where clauses which will be ANDed together
+    values - dict of values used in clauses
+
+    does not support the FROM clause
+    """
+
+    def __init__(self, table, data=None, rawdata=None, clauses=None, values=None):
+        self.table = table
+        self.data = {}
+        if data:
+            self.data.update(data)
+        self.rawdata = {}
+        if rawdata:
+            self.rawdata.update(rawdata)
+        self.clauses = []
+        if clauses:
+            self.clauses.extend(clauses)
+        self.values = {}
+        if values:
+            self.values.update(values)
+
+    def __str__(self):
+        if not self.data and not self.rawdata:
+            return "-- incomplete update: no assigns"
+        parts = ['UPDATE %s SET ' % self.table]
+        assigns = ["%s = %%(data.%s)s" % (key, key) for key in self.data]
+        assigns.extend(["%s = (%s)" % (key, self.rawdata[key]) for key in self.rawdata])
+        parts.append(', '.join(assigns))
+        if self.clauses:
+            parts.append('\nWHERE ')
+            parts.append(' AND '.join(["( %s )" % c for c in self.clauses]))
+        return ''.join(parts)
+
+    def __repr__(self):
+        return "<UpdateProcessor: %r>" % vars(self)
+
+    def get_values(self):
+        """Returns unified values dict, including data"""
+        ret = {}
+        ret.update(self.values)
+        for key in self.data:
+            ret["data."+key] = self.data[key]
+        return ret
+
+    def set(self, **kwargs):
+        """Set data via keyword args"""
+        self.data.update(kwargs)
+
+    def rawset(self, **kwargs):
+        """Set rawdata via keyword args"""
+        self.rawdata.update(kwargs)
+
+    def make_revoke(self, event_id=None, user_id=None):
+        """Add standard revoke options to the update"""
+        if event_id is None:
+            event_id = get_event()
+        if user_id is None:
+            context.session.assertLogin()
+            user_id = context.session.user_id
+        self.data['revoke_event'] = event_id
+        self.data['revoker_id'] = user_id
+        self.rawdata['active'] = 'NULL'
+        self.clauses.append('active = TRUE')
+
+    def execute(self):
+        return _dml(str(self), self.get_values())
+
+
 class QueryProcessor(object):
     """
     Build a query from its components.
@@ -4265,6 +5308,7 @@ class QueryProcessor(object):
         limit: an integer to use in the 'LIMIT' clause
         asList: if True, return results as a list of lists, where each list contains the
                 column values in query order, rather than the usual list of maps
+        rowlock: if True, use "FOR UPDATE" to lock the queried rows
     """
     def __init__(self, columns=None, aliases=None, tables=None,
                  joins=None, clauses=None, values=None, opts=None):
@@ -4327,6 +5371,8 @@ SELECT %(col_str)s
         if self.opts.get('countOnly') and \
            (self.opts.get('offset') or self.opts.get('limit')):
             query = 'SELECT count(*)\nFROM (' + query + ') numrows'
+        if self.opts.get('rowlock'):
+            query += '\n FOR UPDATE'
         return query
 
     def __repr__(self):
@@ -4383,6 +5429,9 @@ SELECT %(col_str)s
             return '%s %i' % (optname.upper(), optval)
         else:
             return ''
+
+    def singleValue(self, strict=True):
+        return _singleValue(str(self), self.values, strict=strict)
 
     def execute(self):
         query = str(self)
@@ -4566,10 +5615,13 @@ class BuildTagTest(koji.policy.BaseSimpleTest):
             #not have a buildroot.
             #or if the entire build was imported, there will be no buildroots
             rpms = context.handlers.call('listRPMs', buildID=data['build'])
-            for rpminfo in rpms:
-                if rpminfo['buildroot_id'] is None:
+            archives = list_archives(buildID=data['build'])
+            br_list = [r['buildroot_id'] for r in rpms]
+            br_list.extend([a['buildroot_id'] for a in archives])
+            for br_id in br_list:
+                if br_id is None:
                     continue
-                tagname = get_buildroot(rpminfo['buildroot_id'])['tag_name']
+                tagname = get_buildroot(br_id)['tag_name']
                 for pattern in args:
                     if fnmatch.fnmatch(tagname, pattern):
                         return True
@@ -4581,8 +5633,8 @@ class BuildTagTest(koji.policy.BaseSimpleTest):
 class ImportedTest(koji.policy.BaseSimpleTest):
     """Check if any part of a build was imported
 
-    This is determined by checking the buildroots of the rpms
-    True if any rpm lacks a buildroot (strict)"""
+    This is determined by checking the buildroots of the rpms and archives
+    True if any of them lack a buildroot (strict)"""
     name = 'imported'
     def run(self, data):
         rpms = context.handlers.call('listRPMs', buildID=data['build'])
@@ -4590,8 +5642,30 @@ class ImportedTest(koji.policy.BaseSimpleTest):
         for rpminfo in rpms:
             if rpminfo['buildroot_id'] is None:
                 return True
+        for archive in list_archives(buildID=data['build']):
+            if archive['buildroot_id'] is None:
+                return True
         #otherwise...
         return False
+
+class ChildTaskTest(koji.policy.BoolTest):
+    name = 'is_child_task'
+    field = 'parent'
+
+class MethodTest(koji.policy.MatchTest):
+    name = 'method'
+    field = 'method'
+
+class UserTest(koji.policy.MatchTest):
+    """Checks username against glob patterns"""
+    name = 'user'
+    field = '_username'
+    def run(self, data):
+        user = policy_get_user(data)
+        if not user:
+            return False
+        data[self.field] = user['name']
+        return super(UserTest, self).run(data)
 
 class IsBuildOwnerTest(koji.policy.BaseSimpleTest):
     """Check if user owns the build"""
@@ -4797,6 +5871,7 @@ def importImageInternal(task_id, filename, filesize, arch, mediatype, hash, rpml
     imageinfo['arch'] = arch
     imageinfo['mediatype'] = mediatype
     imageinfo['hash'] = hash
+    # TODO: add xmlfile field to the imageinfo table
 
     koji.plugin.run_callbacks('preImport', type='image', image=imageinfo)
 
@@ -4827,37 +5902,36 @@ def importImageInternal(task_id, filename, filesize, arch, mediatype, hash, rpml
 
     return image_id
 
-def moveImageResults(task_id, image_id, arch):
+def moveImageResults(task_id, image_id, arch, mediatype):
     """
     Move the image file from the work/task directory into its more
     permanent resting place. This shouldn't be called for scratch images.
     """
     source_path = os.path.join(koji.pathinfo.work(),
                                koji.pathinfo.taskrelpath(task_id))
-    final_path = os.path.join(koji.pathinfo.imageFinalPath(),
-                              koji.pathinfo.livecdRelPath(image_id))
+    if mediatype == 'LiveCD ISO':
+        final_path = os.path.join(koji.pathinfo.imageFinalPath(),
+                                  koji.pathinfo.livecdRelPath(image_id))
+    else:
+        final_path = os.path.join(koji.pathinfo.imageFinalPath(),
+                                  koji.pathinfo.applianceRelPath(image_id))
     log_path = os.path.join(final_path, 'data', 'logs', arch)
     if os.path.exists(final_path) or os.path.exists(log_path):
-        raise koji.GenericError, "Error moving LiveCD image: the final " + \
+        raise koji.GenericError, "Error moving image: the final " + \
             "destination already exists!"
     koji.ensuredir(final_path)
     koji.ensuredir(log_path)
 
     src_files = os.listdir(source_path)
-    got_iso = False
     for fname in src_files:
-        if fname.endswith('.iso'):
-            got_iso = True
-            dest_path = final_path
-        else:
+        if fname.endswith('.log') or fname.endswith('.ks'):
             dest_path = log_path
+        else:
+            dest_path = final_path
         os.rename(os.path.join(source_path, fname),
                   os.path.join(dest_path, fname))
         os.symlink(os.path.join(dest_path, fname),
                    os.path.join(source_path, fname))
-
-    if not got_iso:
-        raise koji.GenericError, "Could not move the iso to the final destination!"
 
 #
 # XMLRPC Methods
@@ -4916,16 +5990,84 @@ class RootExports(object):
 
         return make_task('chainbuild',[srcs,target,opts],**taskOpts)
 
-    # Create the livecd task. Called from handle_spin_livecd in the client.
+    def mavenBuild(self, url, target, opts=None, priority=None, channel='maven'):
+        """Create a Maven build task
+
+        url: The url to checkout the source from.  May be a CVS, SVN, or GIT repository.
+        target: the build target
+        priority: the amount to increase (or decrease) the task priority, relative
+                  to the default priority; higher values mean lower priority; only
+                  admins have the right to specify a negative priority here
+        channel: the channel to allocate the task to (defaults to the "maven" channel)
+
+        Returns the task ID
+        """
+        if not context.opts.get('EnableMaven'):
+            raise koji.GenericError, "Maven support not enabled"
+        if not opts:
+            opts = {}
+        taskOpts = {}
+        if priority:
+            if priority < 0:
+                if not context.session.hasPerm('admin'):
+                    raise koji.ActionNotAllowed, 'only admins may create high-priority tasks'
+            taskOpts['priority'] = koji.PRIO_DEFAULT + priority
+        if channel:
+            taskOpts['channel'] = channel
+
+        return make_task('maven', [url, target, opts], **taskOpts)
+
+    def wrapperRPM(self, build, url, target, priority=None, channel='maven', opts=None):
+        """Create a top-level wrapperRPM task
+
+        build: The build to generate wrapper rpms for.  Must be in the COMPLETE state, and have
+               associated Maven jars.
+        url: SCM URL to a specfile fragment
+        target: The build target to use when building the wrapper rpm.  The build_tag of the target will
+                be used to populate the buildroot in which the rpms are built.
+        priority: the amount to increase (or decrease) the task priority, relative
+                  to the default priority; higher values mean lower priority; only
+                  admins have the right to specify a negative priority here
+        channel: the channel to allocate the task to (defaults to the "maven" channel)
+
+        returns the task ID
+        """
+        context.session.assertPerm('admin')
+        if not context.opts.get('EnableMaven'):
+            raise koji.GenericError, "Maven support not enabled"
+
+        if not opts:
+            opts = {}
+
+        build = self.getBuild(build, strict=True)
+        if list_rpms(build['id']) and not opts.get('scratch'):
+            raise koji.PreBuildError, 'wrapper rpms for %s have already been built' % koji.buildLabel(build)
+        build_target = self.getBuildTarget(target)
+        if not build_target:
+            raise koji.PreBuildError, 'no such build target: %s' % target
+        build_tag = self.getTag(build_target['build_tag'], strict=True)
+        repo_info = self.getRepo(build_tag['id'])
+        if not repo_info:
+            raise koji.PreBuildError, 'no repo for tag: %s' % build_tag['name']
+        opts['repo_id'] = repo_info['id']
+
+        taskOpts = {}
+        if priority:
+            taskOpts['priority'] = koji.PRIO_DEFAULT + priority
+        taskOpts['channel'] = channel
+
+        return make_task('wrapperRPM', [url, build_tag, build, None, opts], **taskOpts)
+
+    # Create the image task. Called from _build_image in the client.
     #
-    def livecd (self, arch, target, ksfile, opts=None, priority=None):
+    def buildImage (self, arch, target, ksfile, img_type, opts=None, priority=None):
         """
-        Create a live CD image using a kickstart file and group package list.
+        Create an image using a kickstart file and group package list.
         """
 
-        context.session.assertPerm('livecd')
+        context.session.assertPerm(img_type)
 
-        taskOpts = {'channel': 'livecd'}
+        taskOpts = {'channel': img_type}
         taskOpts['arch'] = arch
         if priority:
             if priority < 0:
@@ -4935,8 +6077,14 @@ class RootExports(object):
 
             taskOpts['priority'] = koji.PRIO_DEFAULT + priority
 
-        return make_task('createLiveCD', [arch, target, ksfile, opts],
-                         **taskOpts)
+        if img_type == 'livecd':
+            task_type = 'createLiveCD'
+        elif img_type == 'appliance':
+            task_type = 'createAppliance'
+        else:
+            raise koji.GenericError, 'unsupported image type: %s' % img_type
+
+        return make_task(task_type, [arch, target, ksfile, opts], **taskOpts)
 
     # Database access to get imageinfo values. Used in parts of kojiweb.
     #
@@ -4970,10 +6118,19 @@ class RootExports(object):
             else:
                 raise koji.GenericError, 'no image for task ID: %i' % taskID
 
+        # find the accompanying xml file, if any
+        if ret != None and ret['mediatype'] != 'LiveCD ISO':
+            imagepath = os.path.join(koji.pathinfo.imageFinalPath(), 
+                                     koji.pathinfo.applianceRelPath(ret['id']))
+            out_files = os.listdir(imagepath)
+            for out_file in out_files:
+                if out_file.endswith('.xml'):
+                    ret['xmlfile'] = out_file
+
         # additional tweaking
         if ret:
-            # Always return filesize as a string instead of an int so XMLRPC doesn't
-            # complain about 32-bit overflow
+            # Always return filesize as a string instead of an int so XMLRPC 
+            # doesn't complain about 32-bit overflow
             ret['filesize'] = str(ret['filesize'])
         return ret
 
@@ -4993,6 +6150,9 @@ class RootExports(object):
 
     def getAPIVersion(self):
         return koji.API_VERSION
+
+    def mavenEnabled(self):
+        return bool(context.opts.get('EnableMaven'))
 
     def showSession(self):
         return "%s" % context.session
@@ -5157,7 +6317,7 @@ class RootExports(object):
     def downloadTaskOutput(self, taskID, fileName, offset=0, size=-1):
         """Download the file with the given name, generated by the task with the
         given ID."""
-        if '..' in fileName or '/' in fileName:
+        if '..' in fileName:
             raise koji.GenericError, 'Invalid file name: %s' % fileName
         filePath = '%s/%s/%s' % (koji.pathinfo.work(), koji.pathinfo.taskrelpath(taskID), fileName)
         filePath = os.path.normpath(filePath)
@@ -5184,15 +6344,21 @@ class RootExports(object):
         is a map containing the values of the st_* attributes returned by
         os.stat()."""
         taskDir = '%s/%s' % (koji.pathinfo.work(), koji.pathinfo.taskrelpath(taskID))
+
         if stat:
-            ret = {}
+            result = {}
         else:
-            ret = []
-        if os.path.isdir(taskDir):
-            output = os.listdir(taskDir)
-            if stat:
-                for filename in output:
-                    stat_info = os.stat(os.path.join(taskDir, filename))
+            result = []
+
+        if not os.path.isdir(taskDir):
+            return result
+
+        for path, dirs, files in os.walk(taskDir):
+            relpath = path[len(taskDir) + 1:]
+            for filename in files:
+                relfilename = os.path.join(relpath, filename)
+                if stat:
+                    stat_info = os.stat(os.path.join(path, filename))
                     stat_map = {}
                     for attr in dir(stat_info):
                         if attr.startswith('st_'):
@@ -5200,10 +6366,12 @@ class RootExports(object):
                                 stat_map[attr] = str(getattr(stat_info, attr))
                             else:
                                 stat_map[attr] = getattr(stat_info, attr)
-                    ret[filename] = stat_map
-            else:
-                ret = output
-        return ret
+
+                    result[relfilename] = stat_map
+                else:
+                    result.append(relfilename)
+
+        return result
 
     createTag = staticmethod(create_tag)
     editTag = staticmethod(old_edit_tag)
@@ -5233,6 +6401,27 @@ class RootExports(object):
     importBuildInPlace = staticmethod(import_build_in_place)
     resetBuild = staticmethod(reset_build)
 
+    def importArchive(self, filepath, buildinfo, type, typeInfo):
+        """
+        Import an archive file and associate it with a build.  The archive can
+        be any non-rpm filetype supported by Koji.
+        
+        filepath: path to the archive file (relative to the Koji workdir)
+        buildinfo: information about the build to associate the archive with
+                   May be a string (NVR), integer (buildID), or dict (containing keys: name, version, release)
+        type: type of the archive being imported.  Currently supported archive types: maven
+        typeInfo: dict of type-specific information
+        """
+        if not context.opts.get('EnableMaven'):
+            raise koji.GenericError, "Maven support not enabled"
+        if type == 'maven':
+            context.session.assertPerm('maven-import')
+            buildinfo = get_build(buildinfo, strict=True)
+            fullpath = '%s/%s' % (koji.pathinfo.work(), filepath)
+            import_archive(fullpath, buildinfo, type, typeInfo)
+        else:
+            koji.GenericError, 'unsupported archive type: %s' % type
+
     untaggedBuilds = staticmethod(untagged_builds)
     tagHistory = staticmethod(tag_history)
 
@@ -5248,6 +6437,22 @@ class RootExports(object):
         if owner is not None:
             data['owner'] = owner
         return new_build(data)
+
+    def createMavenBuild(self, build_info, maven_info):
+        """
+        Associate Maven metadata with an existing build.  The build must
+        not already have associated Maven metadata.  pom_path must be a path
+        on the server (relative to the work/ directory).
+        """
+        context.session.assertPerm('admin')
+        if not context.opts.get('EnableMaven'):
+            raise koji.GenericError, "Maven support not enabled"
+        build = get_build(build_info)
+        if not build:
+            build_id = self.createEmptyBuild(build_info['name'], build_info['version'],
+                                             build_info['release'], build_info['epoch'])
+            build = get_build(build_id, strict=True)
+        new_maven_build(build, maven_info)
 
     def importRPM(self, path, basename):
         """Import an RPM into the database.
@@ -5291,11 +6496,15 @@ class RootExports(object):
             - tag locked
             - missing permission
             - package not in list for tag
-        The force option is really only effect for admins
+            - policy violation
+        The force option is really only effective for admins
 
         If fromtag is specified, this becomes a move operation.
 
-        This call creates a task to do some of the heavy lifting
+        This call creates a task that was originally intended to perform more
+        extensive checks, but never has. We're stuck with this task system until
+        we're ready to break the api.
+
         The return value is the task id
         """
         #first some lookups and basic sanity checks
@@ -5308,34 +6517,37 @@ class RootExports(object):
         pkg_id = build['package_id']
         tag_id = tag['id']
         build_id = build['id']
-        # note: we're just running the quick checks now so we can fail
-        #       early if appropriate, rather then waiting for the task
-        # Make sure package is on the list for this tag
+        # build state check
+        if build['state'] != koji.BUILD_STATES['COMPLETE']:
+            state = koji.BUILD_STATES[build['state']]
+            raise koji.TagError, "build %s not complete: state %s" % (build['nvr'], state)
+        # basic tag access check
+        assert_tag_access(tag_id,user_id=None,force=force)
+        if fromtag:
+            assert_tag_access(fromtag_id,user_id=None,force=force)
+        # package list check
         pkgs = readPackageList(tagID=tag_id, pkgID=pkg_id, inherit=True)
         pkg_error = None
         if not pkgs.has_key(pkg_id):
             pkg_error = "Package %s not in list for %s" % (build['name'], tag['name'])
         elif pkgs[pkg_id]['blocked']:
             pkg_error = "Package %s blocked in %s" % (build['name'], tag['name'])
+        if pkg_error:
+            if force and context.session.hasPerm('admin'):
+                pkglist_add(tag_id,pkg_id,force=True,block=False)
+            else:
+                raise koji.TagError, pkg_error
+        # tag policy check
         policy_data = {'tag' : tag_id, 'build' : build_id, 'fromtag' : fromtag_id}
         if fromtag is None:
             policy_data['operation'] = 'tag'
         else:
             policy_data['operation'] = 'move'
         #don't check policy for admins using force
-        if not force or not context.session.hasPerm('admin'):
+        if not (force and context.session.hasPerm('admin')):
             assert_policy('tag', policy_data)
-        #XXX - we're running this check twice, here and in host.tagBuild (called by the task)
-        if pkg_error:
-            if force and context.session.hasPerm('admin'):
-                pkglist_add(tag_id,pkg_id,force=True,block=False)
-            else:
-                raise koji.TagError, pkg_error
-        #access check
-        assert_tag_access(tag_id,user_id=None,force=force)
-        if fromtag:
-            assert_tag_access(fromtag_id,user_id=None,force=force)
-        #spawn the tagging tasks (it performs more thorough checks)
+            #XXX - we're running this check twice, here and in host.tagBuild (called by the task)
+        #spawn the tagging task
         return make_task('tagBuild', [tag_id, build_id, force, fromtag_id], priority=10)
 
     def untagBuild(self,tag,build,strict=True,force=False):
@@ -5351,7 +6563,7 @@ class RootExports(object):
         policy_data['operation'] = 'untag'
         try:
             #don't check policy for admins using force
-            if not force or not context.session.hasPerm('admin'):
+            if not (force and context.session.hasPerm('admin')):
                 assert_policy('tag', policy_data)
             _untag_build(tag,build,strict=strict,force=force)
             tag_notification(True, None, tag, build, user_id)
@@ -5412,7 +6624,7 @@ class RootExports(object):
         #policy check
         policy_data = {'tag' : tag2, 'fromtag' : tag1, 'operation' : 'move'}
         #don't check policy for admins using force
-        if not force or not context.session.hasPerm('admin'):
+        if not (force and context.session.hasPerm('admin')):
             for build in build_list:
                 policy_data['build'] = build
                 assert_policy('tag', policy_data)
@@ -5426,21 +6638,6 @@ class RootExports(object):
             log_error("\nMade Task: %s\n" % task_id)
             tasklist.append(task_id)
         return tasklist
-
-    def fixTags(self):
-        """A fix for incomplete tag import, adds tag_config entries
-
-        Note the query will only add the tag_config entries if there are
-        no other tag_config entries, so it will not 'undelete' any tags"""
-        c = context.cnx.cursor()
-        q = """
-        INSERT INTO tag_config(tag_id,arches,perm_id,locked)
-        SELECT id,'i386 ia64 ppc ppc64 s390 s390x sparc sparc64 x86_64',NULL,False
-        FROM tag LEFT OUTER JOIN tag_config ON tag.id = tag_config.tag_id
-        WHERE revoke_event IS NULL AND active IS NULL;
-        """
-        context.commit_pending = True
-        c.execute(q)
 
     def listTags(self, build=None, package=None, queryOpts=None):
         """List tags.  If build is specified, only return tags associated with the
@@ -5501,6 +6698,14 @@ class RootExports(object):
         return query.execute()
 
     getBuild = staticmethod(get_build)
+    getMavenBuild = staticmethod(get_maven_build)
+    getArchiveTypes = staticmethod(get_archive_types)
+    getArchiveType = staticmethod(get_archive_type)
+    listArchives = staticmethod(list_archives)
+    getArchive = staticmethod(get_archive)
+    getMavenArchive = staticmethod(get_maven_archive)
+    listArchiveFiles = staticmethod(list_archive_files)
+    getArchiveFile = staticmethod(get_archive_file)
 
     def getChangelogEntries(self, buildID=None, taskID=None, filepath=None, author=None, before=None, after=None, queryOpts=None):
         """Get changelog entries for the build with the given ID,
@@ -5651,32 +6856,39 @@ class RootExports(object):
         task = Task(task_id)
         task.setPriority(priority, recurse=recurse)
 
-    def listTagged(self,tag,event=None,inherit=False,prefix=None,latest=False,package=None,owner=None):
+    def listTagged(self,tag,event=None,inherit=False,prefix=None,latest=False,package=None,owner=None,type=None):
         """List builds tagged with tag"""
         if not isinstance(tag,int):
             #lookup tag id
             tag = get_tag_id(tag,strict=True)
-        results = readTaggedBuilds(tag,event,inherit=inherit,latest=latest,package=package,owner=owner)
+        results = readTaggedBuilds(tag,event,inherit=inherit,latest=latest,package=package,owner=owner,type=type)
         if prefix:
             prefix = prefix.lower()
             results = [build for build in results if build['package_name'].lower().startswith(prefix)]
         return results
 
-    def listTaggedRPMS(self,tag,event=None,inherit=False,latest=False,package=None,arch=None,rpmsigs=False,owner=None):
+    def listTaggedRPMS(self,tag,event=None,inherit=False,latest=False,package=None,arch=None,rpmsigs=False,owner=None,type=None):
         """List rpms and builds within tag"""
         if not isinstance(tag,int):
             #lookup tag id
             tag = get_tag_id(tag,strict=True)
-        return readTaggedRPMS(tag,event=event,inherit=inherit,latest=latest,package=package,arch=arch,rpmsigs=rpmsigs,owner=owner)
+        return readTaggedRPMS(tag,event=event,inherit=inherit,latest=latest,package=package,arch=arch,rpmsigs=rpmsigs,owner=owner,type=type)
+
+    def listTaggedArchives(self, tag, event=None, inherit=False, latest=False, package=None, type=None):
+        """List archives and builds within a tag"""
+        if not isinstance(tag, int):
+            tag = get_tag_id(tag,strict=True)
+        return readTaggedArchives(tag, event=event, inherit=inherit, latest=latest, package=package, type=type)
 
     def listBuilds(self, packageID=None, userID=None, taskID=None, prefix=None, state=None,
                    createdBefore=None, createdAfter=None,
-                   completeBefore=None, completeAfter=None, queryOpts=None):
+                   completeBefore=None, completeAfter=None, type=None, typeInfo=None, queryOpts=None):
         """List package builds.
         If packageID is specified, restrict the results to builds of the specified package.
         If userID is specified, restrict the results to builds owned by the given user.
         If taskID is specfied, restrict the results to builds with the given task ID.  If taskID is -1,
            restrict the results to builds with a non-null taskID.
+        One or more of packageID, userID, and taskID may be specified.
         If prefix is specified, restrict the results to builds whose package name starts with that
         prefix.
         If createdBefore and/or createdAfter are specified, restrict the results to builds whose
@@ -5685,7 +6897,12 @@ class RootExports(object):
         completion_time is before and/or after the given time.
         The time may be specified as a floating point value indicating seconds since the Epoch (as
         returned by time.time()) or as a string in ISO format ('YYYY-MM-DD HH24:MI:SS').
-        One or more of packageID, userID, and taskID may be specified.
+        If type is not None, only list builds of the associated type.  Currently the only supported type is 'maven'.
+        if typeInfo is not None, only list builds with matching type-specific info.  Must be used in conjunction with
+           the type parameter.
+             Currently the only supported type is 'maven', and typeInfo is a dict containing
+             one or more of group_id, artifact_id, and/or version.  Output will be restricted to builds with
+             matching Maven metadata.
 
         Returns a list of maps.  Each map contains the following keys:
 
@@ -5707,16 +6924,22 @@ class RootExports(object):
           - completion_ts
           - task_id
 
+        If type == 'maven', each map will also contain the following keys:
+
+          - maven_group_id
+          - maven_artifact_id
+          - maven_version
+
         If no builds match, an empty list is returned.
         """
-        fields = (('build.id', 'build_id'), ('build.version', 'version'), ('build.release', 'release'),
+        fields = [('build.id', 'build_id'), ('build.version', 'version'), ('build.release', 'release'),
                   ('build.epoch', 'epoch'), ('build.state', 'state'), ('build.completion_time', 'completion_time'),
                   ('events.id', 'creation_event_id'), ('events.time', 'creation_time'), ('build.task_id', 'task_id'),
                   ('EXTRACT(EPOCH FROM events.time)','creation_ts'),
                   ('EXTRACT(EPOCH FROM build.completion_time)','completion_ts'),
                   ('package.id', 'package_id'), ('package.name', 'package_name'), ('package.name', 'name'),
                   ("package.name || '-' || build.version || '-' || build.release", 'nvr'),
-                  ('users.id', 'owner_id'), ('users.name', 'owner_name'))
+                  ('users.id', 'owner_id'), ('users.name', 'owner_name')]
 
         tables = ['build']
         joins = ['events ON build.create_event = events.id',
@@ -5752,6 +6975,25 @@ class RootExports(object):
             if not isinstance(completeAfter, str):
                 completeAfter = datetime.datetime.fromtimestamp(completeAfter).isoformat(' ')
             clauses.append('build.completion_time > %(completeAfter)s')
+        if type is None:
+            pass
+        elif type == 'maven':
+            joins.append('maven_builds ON build.id = maven_builds.build_id')
+            fields.extend([('maven_builds.group_id', 'maven_group_id'),
+                           ('maven_builds.artifact_id', 'maven_artifact_id'),
+                           ('maven_builds.version', 'maven_version')])
+            if typeInfo:
+                if typeInfo.has_key('group_id'):
+                    clauses.append('maven_builds.group_id = %(group_id)s')
+                    group_id = typeInfo['group_id']
+                if typeInfo.has_key('artifact_id'):
+                    clauses.append('maven_builds.artifact_id = %(artifact_id)s')
+                    artifact_id = typeInfo['artifact_id']
+                if typeInfo.has_key('version'):
+                    clauses.append('maven_builds.version = %(version)s')
+                    version = typeInfo['version']
+        else:
+            raise koji.GenericError, 'unsupported build type: %s' % type
 
         query = QueryProcessor(columns=[pair[0] for pair in fields],
                                aliases=[pair[1] for pair in fields],
@@ -5760,19 +7002,19 @@ class RootExports(object):
 
         return query.execute()
 
-    def getLatestBuilds(self,tag,event=None,package=None):
+    def getLatestBuilds(self,tag,event=None,package=None,type=None):
         """List latest builds for tag (inheritance enabled)"""
         if not isinstance(tag,int):
             #lookup tag id
             tag = get_tag_id(tag,strict=True)
-        return readTaggedBuilds(tag,event,inherit=True,latest=True,package=package)
+        return readTaggedBuilds(tag,event,inherit=True,latest=True,package=package,type=type)
 
-    def getLatestRPMS(self, tag, package=None, arch=None, event=None, rpmsigs=False):
+    def getLatestRPMS(self, tag, package=None, arch=None, event=None, rpmsigs=False, type=None):
         """List latest RPMS for tag (inheritance enabled)"""
         if not isinstance(tag,int):
             #lookup tag id
             tag = get_tag_id(tag,strict=True)
-        return readTaggedRPMS(tag, package=package, arch=arch, event=event,inherit=True,latest=True, rpmsigs=rpmsigs)
+        return readTaggedRPMS(tag, package=package, arch=arch, event=event, inherit=True, latest=True, rpmsigs=rpmsigs, type=type)
 
     def getAverageBuildDuration(self, package):
         """Get the average duration of a build of the given package.
@@ -5843,79 +7085,7 @@ class RootExports(object):
                 mapping[int(key)] = mapping[key]
         return readFullInheritance(tag,event,reverse,stops,jumps)
 
-    def listRPMs(self, buildID=None, buildrootID=None, imageID=None, componentBuildrootID=None, hostID=None, arches=None, queryOpts=None):
-        """List RPMS.  If buildID, imageID and/or buildrootID are specified,
-        restrict the list of RPMs to only those RPMs that are part of that
-        build, or were built in that buildroot.  If componentBuildrootID is specified,
-        restrict the list to only those RPMs that will get pulled into that buildroot
-        when it is used to build another package.  A list of maps is returned, each map
-        containing the following keys:
-
-        - id
-        - name
-        - version
-        - release
-        - nvr (synthesized for sorting purposes)
-        - arch
-        - epoch
-        - payloadhash
-        - size
-        - buildtime
-        - build_id
-        - buildroot_id
-        - external_repo_id
-        - external_repo_name
-
-        If componentBuildrootID is specified, two additional keys will be included:
-        - component_buildroot_id
-        - is_update
-
-        If no build has the given ID, or the build generated no RPMs,
-        an empty list is returned."""
-        fields = [('rpminfo.id', 'id'), ('rpminfo.name', 'name'), ('rpminfo.version', 'version'),
-                  ('rpminfo.release', 'release'),
-                  ("rpminfo.name || '-' || rpminfo.version || '-' || rpminfo.release", 'nvr'),
-                  ('rpminfo.arch', 'arch'),
-                  ('rpminfo.epoch', 'epoch'), ('rpminfo.payloadhash', 'payloadhash'),
-                  ('rpminfo.size', 'size'), ('rpminfo.buildtime', 'buildtime'),
-                  ('rpminfo.build_id', 'build_id'), ('rpminfo.buildroot_id', 'buildroot_id'),
-                  ('rpminfo.external_repo_id', 'external_repo_id'),
-                  ('external_repo.name', 'external_repo_name'),
-                 ]
-        joins = ['external_repo ON rpminfo.external_repo_id = external_repo.id']
-        clauses = []
-
-        if buildID != None:
-            clauses.append('rpminfo.build_id = %(buildID)i')
-        if buildrootID != None:
-            clauses.append('rpminfo.buildroot_id = %(buildrootID)i')
-        if componentBuildrootID != None:
-            fields.append(('buildroot_listing.buildroot_id as component_buildroot_id',
-                           'component_buildroot_id'))
-            fields.append(('buildroot_listing.is_update', 'is_update'))
-            joins.append('buildroot_listing ON rpminfo.id = buildroot_listing.rpm_id')
-            clauses.append('buildroot_listing.buildroot_id = %(componentBuildrootID)i')
-
-        # image specific constraints
-        if imageID != None:
-           clauses.append('imageinfo_listing.image_id = %(imageID)i')
-           joins.append('imageinfo_listing ON rpminfo.id = imageinfo_listing.rpm_id')
-
-        if hostID != None:
-            joins.append('buildroot ON rpminfo.buildroot_id = buildroot.id')
-            clauses.append('buildroot.host_id = %(hostID)i')
-        if arches != None:
-            if isinstance(arches, list) or isinstance(arches, tuple):
-                clauses.append('rpminfo.arch IN %(arches)s')
-            elif isinstance(arches, str):
-                clauses.append('rpminfo.arch = %(arches)s')
-            else:
-                raise koji.GenericError, 'invalid type for "arches" parameter: %s' % type(arches)
-
-        query = QueryProcessor(columns=[f[0] for f in fields], aliases=[f[1] for f in fields],
-                               tables=['rpminfo'], joins=joins, clauses=clauses,
-                               values=locals(), opts=queryOpts)
-        return query.execute()
+    listRPMs = staticmethod(list_rpms)
 
     def listBuildRPMs(self,build):
         """Get information about all the RPMs generated by the build with the given
@@ -6200,9 +7370,10 @@ class RootExports(object):
         perm_id = perm['id']
         if perm['name'] in koji.auth.get_user_perms(user_id):
             raise koji.GenericError, 'user %s already has permission: %s' % (userinfo, perm['name'])
-        insert = """INSERT INTO user_perms (user_id, perm_id)
-        VALUES (%(user_id)i, %(perm_id)i)"""
-        _dml(insert, locals())
+        insert = InsertProcessor('user_perms')
+        insert.set(user_id=user_id, perm_id=perm_id)
+        insert.make_create()
+        insert.execute()
 
     def revokePermission(self, userinfo, permission):
         """Revoke a permission from a user"""
@@ -6212,10 +7383,10 @@ class RootExports(object):
         perm_id = perm['id']
         if perm['name'] not in koji.auth.get_user_perms(user_id):
             raise koji.GenericError, 'user %s does not have permission: %s' % (userinfo, perm['name'])
-        update = """UPDATE user_perms
-        SET active = NULL, revoke_event = get_event()
-        WHERE user_id = %(user_id)i and perm_id = %(perm_id)i"""
-        _dml(update, locals())
+        update = UpdateProcessor('user_perms', values=locals(),
+                    clauses=["user_id = %(user_id)i", "perm_id = %(perm_id)i"])
+        update.make_revoke()
+        update.execute()
 
     def createUser(self, username, status=None, krb_principal=None, email=None):
         """Add a user to the database"""
@@ -6359,18 +7530,7 @@ class RootExports(object):
     editBuildTarget = staticmethod(edit_build_target)
     deleteBuildTarget = staticmethod(delete_build_target)
     getBuildTargets = staticmethod(get_build_targets)
-
-    def getBuildTarget(self, info, event=None, strict=False):
-        """Return the build target with the given name or ID.
-        If there is no matching build target, return None."""
-        targets = get_build_targets(info=info, event=event)
-        if len(targets) == 1:
-            return targets[0]
-        else:
-            if strict:
-                raise koji.GenericError, 'No matching build target found: %s' % info
-            else:
-                return None
+    getBuildTarget = staticmethod(get_build_target)
 
     def taskFinished(self,taskId):
         task = Task(taskId)
@@ -6423,6 +7583,7 @@ class RootExports(object):
             state[list]: limit to tasks of given state
             owner[int]: limit to tasks owned by the user with the given ID
             host_id[int]: limit to tasks running on the host with the given ID
+            channel_id[int]: limit to tasks in the specified channel
             parent[int]: limit to tasks with the given parent
             decode[bool]: whether or not xmlrpc data in the 'request' and 'result'
                           fields should be decoded; defaults to False
@@ -6431,6 +7592,12 @@ class RootExports(object):
                                          given date, in either float (seconds since the epoch)
                                          or str (ISO) format
             createdAfter[float or str]: limit to tasks whose create_time is after the
+                                        given date, in either float (seconds since the epoch)
+                                        or str (ISO) format
+            startedBefore[float or str]: limit to tasks whose start_time is before the
+                                         given date, in either float (seconds since the epoch)
+                                         or str (ISO) format
+            startedAfter[float or str]: limit to tasks whose start_time is after the
                                         given date, in either float (seconds since the epoch)
                                         or str (ISO) format
             completeBefore[float or str]: limit to tasks whose completion_time is before
@@ -6445,18 +7612,20 @@ class RootExports(object):
 
         tables = ['task']
         joins = ['users ON task.owner = users.id']
-        fields = ('task.id','state','create_time','completion_time','channel_id',
-                  'host_id','parent','label','waiting','awaited','owner','method',
-                  'arch','priority','weight','request','result', 'users.name', 'users.usertype')
-        aliases = ('id','state','create_time','completion_time','channel_id',
-                   'host_id','parent','label','waiting','awaited','owner','method',
-                   'arch','priority','weight','request','result', 'owner_name', 'owner_type')
+        flist = Task.fields + (
+                    ('task.request', 'request'),
+                    ('task.result', 'result'),
+                    ('users.name', 'owner_name'),
+                    ('users.usertype', 'owner_type'),
+                    )
+        fields = [f[0] for f in flist]
+        aliases = [f[1] for f in flist]
 
         conditions = []
         for f in ['arch','state']:
             if opts.has_key(f):
                 conditions.append('%s IN %%(%s)s' % (f, f))
-        for f in ['owner', 'host_id', 'parent']:
+        for f in ['owner', 'host_id', 'channel_id', 'parent']:
             if opts.has_key(f):
                 if opts[f] is None:
                     conditions.append('%s IS NULL' % f)
@@ -6464,26 +7633,20 @@ class RootExports(object):
                     conditions.append('%s = %%(%s)i' % (f, f))
         if opts.has_key('method'):
             conditions.append('method = %(method)s')
-        if opts.get('createdBefore') != None:
-            createdBefore = opts['createdBefore']
-            if not isinstance(createdBefore, str):
-                opts['createdBefore'] = datetime.datetime.fromtimestamp(createdBefore).isoformat(' ')
-            conditions.append('create_time < %(createdBefore)s')
-        if opts.get('createdAfter') != None:
-            createdAfter = opts['createdAfter']
-            if not isinstance(createdAfter, str):
-                opts['createdAfter'] = datetime.datetime.fromtimestamp(createdAfter).isoformat(' ')
-            conditions.append('create_time > %(createdAfter)s')
-        if opts.get('completeBefore') != None:
-            completeBefore = opts['completeBefore']
-            if not isinstance(completeBefore, str):
-                opts['completeBefore'] = datetime.datetime.fromtimestamp(completeBefore).isoformat(' ')
-            conditions.append('completion_time < %(completeBefore)s')
-        if opts.get('completeAfter') != None:
-            completeAfter = opts['completeAfter']
-            if not isinstance(completeAfter, str):
-                opts['completeAfter'] = datetime.datetime.fromtimestamp(completeAfter).isoformat(' ')
-            conditions.append('completion_time > %(completeAfter)s')
+        time_opts = [
+                ['createdBefore', 'create_time', '<'],
+                ['createdAfter', 'create_time', '>'],
+                ['startedBefore', 'start_time', '<'],
+                ['startedAfter', 'start_time', '>'],
+                ['completedBefore', 'completion_time', '<'],
+                ['completedAfter', 'completion_time', '>'],
+            ]
+        for key, field, cmp in time_opts:
+            if opts.get(key) != None:
+                value = opts[key]
+                if not isinstance(value, str):
+                    opts[key] = datetime.datetime.fromtimestamp(value).isoformat(' ')
+                conditions.append('%(field)s %(cmp)s %%(%(key)s)s' % locals())
 
         query = QueryProcessor(columns=fields, aliases=aliases, tables=tables, joins=joins,
                                clauses=conditions, values=opts, opts=queryOpts)
@@ -6607,6 +7770,8 @@ class RootExports(object):
     editHost = staticmethod(edit_host)
     addHostToChannel = staticmethod(add_host_to_channel)
     removeHostFromChannel = staticmethod(remove_host_from_channel)
+    renameChannel = staticmethod(rename_channel)
+    removeChannel = staticmethod(remove_channel)
 
     def listHosts(self, arches=None, channelID=None, ready=None, enabled=None, userID=None, queryOpts=None):
         """Get a list of hosts.  "arches" is a list of string architecture
@@ -6921,7 +8086,8 @@ class RootExports(object):
                      'target': 'build_target',
                      'user': 'users',
                      'host': 'host',
-                     'rpm': 'rpminfo'}
+                     'rpm': 'rpminfo',
+                     'maven': 'archiveinfo'}
 
     def search(self, terms, type, matchType, queryOpts=None):
         """Search for an item in the database matching "terms".
@@ -6966,6 +8132,11 @@ class RootExports(object):
         elif type == 'target':
             joins.append('build_target_config ON build_target.id = build_target_config.build_target_id')
             clause = 'build_target_config.active = TRUE and name %s %%(terms)s' % oper
+        elif type == 'maven':
+            cols = ('id', 'filename')
+            joins.append('maven_archives ON archiveinfo.id = maven_archives.archive_id')
+            clause = "archiveinfo.filename %s %%(terms)s or maven_archives.group_id || '-' || " \
+                "maven_archives.artifact_id || '-' || maven_archives.version %s %%(terms)s" % (oper, oper)
         else:
             clause = 'name %s %%(terms)s' % oper
 
@@ -7114,6 +8285,41 @@ class BuildRoot(object):
             raise koji.GenericError, "buildroot %(id)s in wrong state %(state)s" % self.data
         self._setList(rpmlist,update=True)
 
+    def getArchiveList(self, queryOpts=None):
+        """Get the list of archives in the buildroot"""
+        tables = ('archiveinfo',)
+        joins = ('buildroot_archives ON archiveinfo.id = buildroot_archives.archive_id',)
+        clauses = ('buildroot_archives.buildroot_id = %(id)i',)
+        columns = ('id', 'type_id', 'build_id', 'archiveinfo.buildroot_id', 'filename', 'size', 'md5sum', 'project_dep')
+        aliases = ('id', 'type_id', 'build_id', 'buildroot_id', 'filename', 'size', 'md5sum', 'project_dep')
+        query = QueryProcessor(tables=tables, columns=columns,
+                               joins=joins, clauses=clauses,
+                               values=self.data,
+                               opts=queryOpts)
+        return query.execute()
+
+    def updateArchiveList(self, archives, project=False):
+        """Update the list of archives in a buildroot.
+        If project is True, the archives are project dependencies.  If False, they dependencies required to setup the
+        build environment."""
+        if not context.opts.get('EnableMaven'):
+            raise koji.GenericError, "Maven support not enabled"
+        if self.data['state'] != koji.BR_STATES['BUILDING']:
+            raise koji.GenericError, "buildroot %(id)s in wrong state %(state)s" % self.data
+        current = dict([(r['id'], 1) for r in self.getArchiveList()])
+        archive_ids = []
+        for archive in archives:
+            if current.has_key(archive['id']):
+                continue
+            else:
+                archive_ids.append(archive['id'])
+        insert = """INSERT INTO buildroot_archives (buildroot_id, archive_id, project_dep)
+        VALUES
+        (%(broot_id)i, %(archive_id)i, %(project)s)"""
+        broot_id = self.id
+        archive_ids.sort()
+        for archive_id in archive_ids:
+            _dml(insert, locals())
 
 class Host(object):
 
@@ -7501,6 +8707,129 @@ class HostExports(object):
         build_notification(task_id, build_id)
         return result
 
+    def initMavenBuild(self, task_id, build_info, maven_info):
+        """Create a new in-progress Maven build
+           Synthesize the release number by taking the (integer) release of the
+           last successful build and incrementing it."""
+        if not context.opts.get('EnableMaven'):
+            raise koji.GenericError, "Maven support not enabled"
+        host = Host()
+        host.verify()
+        task = Task(task_id)
+        task.assertHost(host.id)
+
+        # find the last successful build of this N-V
+        values = {'name': build_info['name'],
+                  'version': build_info['version'],
+                  'state': koji.BUILD_STATES['COMPLETE']}
+        query = QueryProcessor(tables=['build'], joins=['package ON build.pkg_id = package.id'],
+                               columns=['build.id', 'release'],
+                               clauses=['name = %(name)s', 'version = %(version)s',
+                                        'state = %(state)s'],
+                               values=values,
+                               opts={'order': '-build.id', 'limit': 1})
+        result = query.executeOne()
+        release = None
+        if result:
+            release = result['release']
+
+        if not release:
+            release = '1'
+        elif release.isdigit():
+            release = str(int(release) + 1)
+        else:
+            raise koji.BuildError, 'Invalid release value for a Maven build: %s' % release
+        build_info['release'] = release
+
+        data = build_info.copy()
+        data['task_id'] = task_id
+        data['owner'] = task.getOwner()
+        data['state'] = koji.BUILD_STATES['BUILDING']
+        data['completion_time'] = None
+        build_id = new_build(data)
+        build_info['id'] = build_id
+        new_maven_build(build_info, maven_info)
+
+        return build_id, build_info
+
+    def completeMavenBuild(self, task_id, build_id, maven_results, rpm_results):
+        """Complete the Maven build."""
+        if not context.opts.get('EnableMaven'):
+            raise koji.GenericError, "Maven support not enabled"
+        host = Host()
+        host.verify()
+        task = Task(task_id)
+        task.assertHost(host.id)
+
+        build_info = get_build(build_id, strict=True)
+        maven_info = get_maven_build(build_id, strict=True)
+
+        maven_task_id = maven_results['task_id']
+        maven_buildroot_id = maven_results['buildroot_id']
+        maven_task_dir = koji.pathinfo.task(maven_task_id)
+        # import the build output
+        for relpath, files in maven_results['files'].iteritems():
+            dir_maven_info = maven_info
+            poms = [f for f in files if f.endswith('.pom')]
+            if len(poms) == 0:
+                pass
+            elif len(poms) == 1:
+                # This directory has a .pom file, so get the Maven group_id, 
+                # artifact_id, and version from it and associate those with
+                # the artifacts in this directory
+                pom_path = os.path.join(maven_task_dir, relpath, poms[0])
+                pom_info = koji.parse_pom(pom_path)
+                dir_maven_info = koji.pom_to_maven_info(pom_info)
+            else:
+                raise koji.BuildError, 'multiple .pom files in %s: %s' % (relpath, ', '.join(poms))
+
+            for filename in files:
+                archivetype = get_archive_type(filename)
+                if not archivetype:
+                    # Unknown archive type, skip it
+                    continue
+                filepath = os.path.join(maven_task_dir, relpath, filename)
+                import_archive(filepath, build_info, 'maven', dir_maven_info, maven_buildroot_id)
+
+        # move the logs to their final destination
+        for log_path in maven_results['logs']:
+            import_build_log(os.path.join(maven_task_dir, log_path),
+                             build_info, subdir='maven2')
+
+        if rpm_results:
+            _import_wrapper(rpm_results['task_id'], build_info, rpm_results)
+
+        # update build state
+        st_complete = koji.BUILD_STATES['COMPLETE']
+        update = """UPDATE build SET state=%(st_complete)i, completion_time=NOW()
+        WHERE id=%(build_id)i"""
+        _dml(update,locals())
+
+        # send email
+        build_notification(task_id, build_id)
+
+    def importWrapperRPMs(self, task_id, build_id, rpm_results):
+        """Import the wrapper rpms and associate them with the given build.  Any existing
+           rpms are deleted before import."""
+        if not context.opts.get('EnableMaven'):
+            raise koji.GenericError, "Maven support not enabled"
+        host = Host()
+        host.verify()
+        task = Task(task_id)
+        task.assertHost(host.id)
+
+        build_info = get_build(build_id, strict=True)
+
+        if build_info['state'] != koji.BUILD_STATES['COMPLETE']:
+            raise koji.GenericError, 'cannot import wrapper rpms for %s: build state is %s, not complete' % \
+                (koji.buildLabel(build_info), koji.BUILD_STATES[build_info['state']].lower())
+
+        if list_rpms(buildID=build_info['id']):
+            # don't allow overwriting of already-imported wrapper RPMs
+            raise koji.GenericError, 'wrapper rpms for %s have already been imported' % koji.buildLabel(build_info)
+
+        _import_wrapper(task.id, build_info, rpm_results)
+
     def failBuild(self, task_id, build_id):
         """Mark the build as failed.  If the current state is not
         'BUILDING', or the current competion_time is not null, a
@@ -7564,17 +8893,18 @@ class HostExports(object):
             _untag_build(fromtag,build,user_id=user_id,force=force,strict=True)
         _tag_build(tag,build,user_id=user_id,force=force)
 
-    # Called from kojid::LiveCDTask
     def importImage(self, task_id, filename, filesize, arch, mediatype, hash, rpmlist):
-        """Import a built image, populating the database with metadata and moving the image
-        to its final location."""
+        """
+        Import a built image, populating the database with metadata and 
+        moving the image to its final location.
+        """
         host = Host()
         host.verify()
         task = Task(task_id)
         task.assertHost(host.id)
-        image_id = importImageInternal(task_id, filename, filesize, arch, mediatype,
-                                       hash, rpmlist)
-        moveImageResults(task_id, image_id, arch)
+        image_id = importImageInternal(task_id, filename, filesize, arch,
+                                       mediatype, hash, rpmlist)
+        moveImageResults(task_id, image_id, arch, mediatype)
         return image_id
 
     def tagNotification(self, is_successful, tag_id, from_id, build_id, user_id, ignore_success=False, failure_msg=''):
@@ -7634,6 +8964,78 @@ class HostExports(object):
         if task_id is not None:
             br.assertTask(task_id)
         return br.updateList(rpmlist)
+
+    def updateMavenBuildRootList(self, brootid, task_id, mavenlist, ignore=None, project=False):
+        if not context.opts.get('EnableMaven'):
+            raise koji.GenericError, "Maven support not enabled"
+        host = Host()
+        host.verify()
+        Task(task_id).assertHost(host.id)
+        br = BuildRoot(brootid)
+        br.assertHost(host.id)
+        br.assertTask(task_id)
+
+        repo = repo_info(br.data['repo_id'], strict=True)
+        tag = get_tag(repo['tag_id'], strict=True)
+        tag_builds = maven_tag_packages(tag, repo['create_event'])
+        archives_by_label = {}
+        for build in tag_builds:
+            maven_info = {'group_id': build['maven_group_id'],
+                          'artifact_id': build['maven_artifact_id'],
+                          'version': build['maven_version']}
+            maven_label = koji.mavenLabel(maven_info)
+            if archives_by_label.has_key(maven_label):
+                # A previous build has already claimed this groupId-artifactId-version, and thus
+                # the spot in the filesystem.  This build never made it into the build environment.
+                continue
+            newly_added_versions = [maven_label]
+            archives_by_label[maven_label] = {}
+            for archive in list_archives(buildID=build['id'], type='maven'):
+                archive_label = koji.mavenLabel(archive)
+                if archive_label in newly_added_versions:
+                    archives_by_label[archive_label][archive['filename']] = archive
+                elif not archives_by_label.has_key(archive_label):
+                    # These archives have a different label than their parent build, but that label
+                    # has not been processed yet.  These archives may have made their way into the
+                    # build environment.
+                    newly_added_versions.append(archive_label)
+                    archives_by_label[archive_label] = {}
+                    archives_by_label[archive_label][archive['filename']] = archive
+                else:
+                    # We've already added entries for archives with this label, but associated
+                    # with another build.  These archives never made it into the build environment.
+                    continue
+
+        if not ignore:
+            ignore = []
+        ignore_by_label = {}
+        for entry in ignore:
+            ignore_info = entry['maven_info']
+            ignore_label = koji.mavenLabel(ignore_info)
+            if not ignore_by_label.has_key(ignore_label):
+                ignore_by_label[ignore_label] = {}
+            for fileinfo in entry['files']:
+                ignore_by_label[ignore_label][fileinfo['filename']] = fileinfo
+
+        archives = []
+        for entry in mavenlist:
+            maven_info = entry['maven_info']
+            maven_label = koji.mavenLabel(maven_info)
+            ignore_archives = ignore_by_label.get(maven_label, {})
+            tag_archives = archives_by_label.get(maven_label, {})
+
+            for fileinfo in entry['files']:
+                ignore_archive = ignore_archives.get(fileinfo['filename'])
+                tag_archive = tag_archives.get(fileinfo['filename'])
+                if ignore_archive and fileinfo['size'] == ignore_archive['size']:
+                    continue
+                elif tag_archive and fileinfo['size'] == tag_archive['size']:
+                    archives.append(tag_archive)
+                else:
+                    raise koji.BuildrootError, 'Unknown file in build environment: %s, size: %s' % \
+                        ('%s/%s' % (fileinfo['path'], fileinfo['filename']), fileinfo['size'])
+
+        return br.updateArchiveList(archives, project)
 
     def repoInit(self, tag, with_src=False, with_debuginfo=False, event=None):
         """Initialize a new repo for tag"""

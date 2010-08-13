@@ -35,6 +35,7 @@ from koji.util import md5_constructor
 import os
 import os.path
 import pwd
+import random
 import re
 import rpm
 import signal
@@ -49,8 +50,11 @@ import urlparse
 import util
 import xmlrpclib
 from xmlrpclib import loads, Fault
+import xml.sax
+import xml.sax.handler
 import ssl.XMLRPCServerProxy
 import OpenSSL.SSL
+import zipfile
 
 def _(args):
     """Stub function for translation"""
@@ -289,6 +293,10 @@ class CallbackError(PluginError):
     """Raised when there is an error executing a callback"""
     faultCode = 1017
 
+class ApplianceError(GenericError):
+    """Raised when Appliance Image creation fails"""
+    faultCode = 1018
+
 class MultiCallInProgress(object):
     """
     Placeholder class to be returned by method calls when in the process of
@@ -360,6 +368,15 @@ def decode_args(*args):
             opts = last
             args = args[:-1]
     return args,opts
+
+def decode_args2(args, names, strict=True):
+    "An alternate form of decode_args, returns a dictionary"
+    args, opts = decode_args(*args)
+    if strict and len(names) < len(args):
+        raise TypeError, "Expecting at most %i arguments" % len(names)
+    ret = dict(zip(names, args))
+    ret.update(opts)
+    return ret
 
 def encode_int(n):
     """If n is too large for a 32bit signed, convert it to a string"""
@@ -837,6 +854,12 @@ def parse_NVRA(nvra):
         ret['location'] = location
     return ret
 
+def is_debuginfo(name):
+    """Determines if an rpm is a debuginfo rpm, based on name"""
+    if name.endswith('-debuginfo') or name.endswith('-debuginfo-common'):
+        return True
+    return False
+
 def canonArch(arch):
     """Given an arch, return the "canonical" arch"""
     #XXX - this could stand to be smarter, and we should probably
@@ -855,6 +878,114 @@ def canonArch(arch):
         return 'alpha'
     else:
         return arch
+
+class POMHandler(xml.sax.handler.ContentHandler):
+    def __init__(self, values, fields):
+        xml.sax.handler.ContentHandler.__init__(self)
+        self.tag_stack = []
+        self.tag_content = None
+        self.values = values
+        self.fields = fields
+
+    def startElement(self, name, attrs):
+        self.tag_stack.append(name)
+        self.tag_content = ''
+
+    def characters(self, content):
+        self.tag_content += content
+
+    def endElement(self, name):
+        if len(self.tag_stack) in (2, 3) and self.tag_stack[-1] in self.fields:
+            if self.tag_stack[-2] == 'parent':
+                # Only set a value from the "parent" tag if we don't already have
+                # that value set
+                if not self.values.has_key(self.tag_stack[-1]):
+                    self.values[self.tag_stack[-1]] = self.tag_content.strip()
+            elif self.tag_stack[-2] == 'project':
+                self.values[self.tag_stack[-1]] = self.tag_content.strip()
+        self.tag_content = ''
+        self.tag_stack.pop()
+
+    def reset(self):
+        self.tag_stack = []
+        self.tag_content = None
+        self.values.clear()
+
+ENTITY_RE = re.compile(r'&[A-Za-z0-9]+;')
+
+def parse_pom(path=None, contents=None):
+    """
+    Parse the Maven .pom file return a map containing information
+    extracted from it.  The map will contain at least the following
+    fields:
+
+    groupId
+    artifactId
+    version
+    """
+    fields = ('groupId', 'artifactId', 'version')
+    values = {}
+    handler = POMHandler(values, fields)
+    if path:
+        fd = file(path)
+        contents = fd.read()
+        fd.close()
+
+    if not contents:
+        raise GenericError, 'either a path to a pom file or the contents of a pom file must be specified'
+
+    # A common problem is non-UTF8 characters in XML files, so we'll convert the string first
+    
+    contents = fixEncoding(contents)
+
+    try:
+        xml.sax.parseString(contents, handler)
+    except xml.sax.SAXParseException:
+        # likely an undefined entity reference, so lets try replacing
+        # any entity refs we can find and see if we get something parseable
+        handler.reset()
+        contents = ENTITY_RE.sub('?', contents)
+        xml.sax.parseString(contents, handler)
+
+    for field in fields:
+        if field not in values.keys():
+            raise GenericError, 'could not extract %s from POM: %s' % (field, (path or '<contents>'))
+    return values
+
+def pom_to_maven_info(pominfo):
+    """
+    Convert the output of parsing a POM into a format compatible
+    with Koji.
+    The mapping is as follows:
+    - groupId: group_id
+    - artifactId: artifact_id
+    - version: version
+    """
+    maveninfo = {'group_id': pominfo['groupId'],
+                 'artifact_id': pominfo['artifactId'],
+                 'version': pominfo['version']}
+    return maveninfo
+
+def maven_info_to_nvr(maveninfo):
+    """
+    Convert the maveninfo to NVR-compatible format.
+    The release cannot be determined from Maven metadata, and will
+    be set to None.
+    """
+    nvr = {'name': maveninfo['group_id'] + '-' + maveninfo['artifact_id'],
+           'version': maveninfo['version'].replace('-', '_'),
+           'release': None,
+           'epoch': None}
+    # for backwards-compatibility
+    nvr['package_name'] = nvr['name']
+    return nvr
+
+def mavenLabel(maveninfo):
+    """
+    Return a user-friendly label for the given maveninfo.  maveninfo is
+    a dict as returned by kojihub:getMavenBuild().
+    """
+    return '%(group_id)s-%(artifact_id)s-%(version)s' % maveninfo
 
 def hex_string(s):
     """Converts a string to a string of hex digits"""
@@ -1105,6 +1236,8 @@ def genMockConfig(name, arch, managed=False, repoid=None, tag_name=None, **opts)
         etc_hosts = file('/etc/hosts')
         files['etc/hosts'] = etc_hosts.read()
         etc_hosts.close()
+    if opts.get('maven_opts', False):
+        files['etc/mavenrc'] = 'MAVEN_OPTS="%s"\n' % opts['maven_opts']
 
     config_opts['yum.conf'] = """[main]
 cachedir=/var/cache/yum
@@ -1232,16 +1365,41 @@ def openRemoteFile(relpath, topurl=None, topdir=None):
 
 
 class PathInfo(object):
+    # ASCII numbers and upper- and lower-case letter for use in tmpdir()
+    ASCII_CHARS = [chr(i) for i in range(48, 58) + range(65, 91) + range(97, 123)]
 
-    def __init__(self,topdir=None):
-        if topdir is None:
-            self.topdir = BASEDIR
-        else:
-            self.topdir = topdir
+    def __init__(self, topdir=None):
+        self._topdir = topdir
+
+    def topdir(self):
+        if self._topdir is None:
+            self._topdir = str(BASEDIR)
+        return self._topdir
+
+    def _set_topdir(self, topdir):
+        self._topdir = topdir
+
+    topdir = property(topdir, _set_topdir)
 
     def build(self,build):
         """Return the directory where a build belongs"""
         return self.topdir + ("/packages/%(name)s/%(version)s/%(release)s" % build)
+
+    def mavenbuild(self, build, maveninfo):
+        """Return the directory where the Maven build exists in the global store (/mnt/koji/maven2)"""
+        group_path = maveninfo['group_id'].replace('.', '/')
+        artifact_id = maveninfo['artifact_id']
+        version = maveninfo['version']
+        release = build['release']
+        return self.topdir + ("/maven2/%(group_path)s/%(artifact_id)s/%(version)s/%(release)s" % locals())
+
+    def mavenrepo(self, build, maveninfo):
+        """Return the directory where the Maven artifact exists in the per-tag Maven repo
+        (/mnt/koji/repos/tag-name/repo-id/maven2/)"""
+        group_path = maveninfo['group_id'].replace('.', '/')
+        artifact_id = maveninfo['artifact_id']
+        version = maveninfo['version']
+        return self.topdir + ("/maven2/%(group_path)s/%(artifact_id)s/%(version)s" % locals())
 
     def rpm(self,rpminfo):
         """Return the path (relative to build_dir) where an rpm belongs"""
@@ -1275,6 +1433,10 @@ class PathInfo(object):
         """Return the relative path for the livecd image directory"""
         return os.path.join('livecd', str(image_id % 10000), str(image_id))
 
+    def applianceRelPath(self, image_id):
+        """Return the relative path for the appliance image directory"""
+        return os.path.join('appliance', str(image_id % 10000), str(image_id))
+
     def imageFinalPath(self):
         """Return the absolute path to where completed images can be found"""
         return os.path.join(self.topdir, 'images')
@@ -1283,9 +1445,20 @@ class PathInfo(object):
         """Return the work dir"""
         return self.topdir + '/work'
 
+    def tmpdir(self):
+        """Return a path to a unique directory under work()/tmp/"""
+        tmp = None
+        while tmp is None or os.path.exists(tmp):
+            tmp = self.work() + '/tmp/' + ''.join([random.choice(self.ASCII_CHARS) for dummy in '123456'])
+        return tmp
+
     def scratch(self):
         """Return the main scratch dir"""
         return self.topdir + '/scratch'
+
+    def task(self, task_id):
+        """Return the output directory for the task with the given id"""
+        return self.work() + '/' + self.taskrelpath(task_id)
 
 pathinfo = PathInfo()
 
@@ -1322,6 +1495,7 @@ class ClientSession(object):
         if self.opts.get('timeout'):
             self.proxyOpts['timeout'] = self.opts['timeout']
         self.baseurl = baseurl
+        self.origurl = None
         self.setSession(sinfo)
         self.multicall = False
         self._calls = []
@@ -1335,8 +1509,9 @@ class ClientSession(object):
             self.logged_in = False
             self.callnum = None
             # undo state changes made by ssl_login()
-            if self.baseurl.startswith('https:'):
-                self.baseurl = self.baseurl.replace('https:', 'http:')
+            if self.origurl:
+                self.baseurl = self.origurl
+                self.origurl = None
             self.opts.pop('certs', None)
             self.proxyOpts.pop('certs', None)
             self.opts.pop('timeout', None)
@@ -1446,7 +1621,8 @@ class ClientSession(object):
 
     def ssl_login(self, cert, ca, serverca, proxyuser=None):
         if not self.baseurl.startswith('https:'):
-            self.baseurl = self.baseurl.replace('http:', 'https:')
+            self.origurl = self.baseurl
+            self.baseurl = self.baseurl.replace('http:', 'https:', 1)
         
         certs = {}
         certs['key_and_cert'] = cert
@@ -1454,7 +1630,8 @@ class ClientSession(object):
         certs['peer_ca_cert'] = serverca
 
         # 60 second timeout during login
-        self.proxy = ssl.XMLRPCServerProxy.PlgXMLRPCServerProxy(self.baseurl, certs, timeout=60, **self.proxyOpts)
+        # Append /login to the URL so we can only require client certs to be sent on login requests
+        self.proxy = ssl.XMLRPCServerProxy.PlgXMLRPCServerProxy(self.baseurl + '/ssllogin', certs, timeout=60, **self.proxyOpts)
         sinfo = self.callMethod('sslLogin', proxyuser)
         if not sinfo:
             raise AuthError, 'unable to obtain a session'
@@ -1718,7 +1895,9 @@ class DBHandler(logging.Handler):
             #note we're letting cursor.execute do the escaping
             cursor.execute(command,data)
             cursor.close()
-            self.cnx.commit()
+            #self.cnx.commit()
+            #XXX - commiting here is most likely wrong, but we need to set commit_pending or something
+            #      ...and this is really the wrong place for that
         except:
             self.handleError(record)
 
@@ -1789,7 +1968,7 @@ def taskLabel(taskInfo):
     method = taskInfo['method']
     arch = taskInfo['arch']
     extra = ''
-    if method == 'build':
+    if method in ('build', 'maven'):
         if taskInfo.has_key('request'):
             source, target = taskInfo['request'][:2]
             if '://' in source:
@@ -1806,6 +1985,18 @@ def taskLabel(taskInfo):
             srpm, tagID, arch = taskInfo['request'][:3]
             srpm = os.path.basename(srpm)
             extra = '%s, %s' % (srpm, arch)
+    elif method == 'buildMaven':
+        if taskInfo.has_key('request'):
+            build_tag = taskInfo['request'][1]
+            extra = build_tag['name']
+    elif method == 'wrapperRPM':
+        if taskInfo.has_key('request'):
+            build_tag = taskInfo['request'][1]
+            build = taskInfo['request'][2]
+            if build:
+                extra = '%s, %s' % (build_tag['name'], buildLabel(build))
+            else:
+                extra = build_tag['name']
     elif method == 'buildNotification':
         if taskInfo.has_key('request'):
             build = taskInfo['request'][1]

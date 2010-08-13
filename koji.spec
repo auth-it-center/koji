@@ -8,14 +8,14 @@
 %define release %{baserelease}
 %endif
 Name: koji
-Version: 1.3.2
+Version: 1.4.0
 Release: %{release}%{?dist}
 License: LGPLv2 and GPLv2+
 # koji.ssl libs (from plague) are GPLv2+
 Summary: Build system tools
 Group: Applications/System
 URL: http://fedorahosted.org/koji
-Source: https://fedorahosted.org/koji/attachment/wiki/KojiRelease/%{name}-%{PACKAGE_VERSION}.tar.bz2
+Source: https://fedorahosted.org/koji/attachment/wiki/KojiRelease/%{name}-%{version}.tar.bz2
 BuildRoot: %{_tmppath}/%{name}-%{version}-%{release}-root-%(%{__id_u} -n)
 BuildArch: noarch
 Requires: python-krbV >= 1.0.13
@@ -67,8 +67,11 @@ Requires(pre): /usr/sbin/useradd
 Requires: /usr/bin/cvs
 Requires: /usr/bin/svn
 Requires: /usr/bin/git
-%if 0%{?rhel} >= 5
+Requires: python-cheetah
+%if 0%{?rhel} == 5
 Requires: createrepo >= 0.4.11-2
+Requires: python-hashlib
+Requires: python-createrepo
 %endif
 %if 0%{?fedora} >= 9
 Requires: createrepo >= 0.9.2
@@ -193,6 +196,26 @@ if [ $1 = 0 ]; then
 fi
 
 %changelog
+* Thu Jul  8 2010 Mike McLean <mikem at redhat.com> - 1.4.0-1
+- Merge mead branch: support for building jars with Maven *
+- support for building appliance images *
+- soft dependencies for LiveCD/Appliance features
+- smarter prioritization of repo regenerations
+- package list policy to determine if package list changes are allowed
+- channel policy to determine which channel a task is placed in
+- edit host data via webui
+- description and comment fields for hosts *
+- cleaner log entries for kojihub
+- track user data in versioned tables *
+- allow setting retry parameters for the cli
+- track start time for tasks *
+- allow packages built from the same srpm to span multiple external repos
+- make the command used to fetch sources configuable per repo
+- kojira: remove unexpected directories
+- let kojid to decide if it can handle a noarch task
+- avoid extraneous ssl handshakes
+- schema changes to support starred items
+
 * Wed Mar 31 2010 Christos Triantafyllidis <ctria@grid.auth.gr> - 1.3.2-4%{?distribution}
 - Fixed email support
 
@@ -211,6 +234,11 @@ fi
 * Tue Nov 10 2009 Mike Bonnet <mikeb@redhat.com> - 1.3.2-1
 - support for LiveCD creation
 - new event-based callback system
+
+* Fri Jun 12 2009 Mike Bonnet <mikeb@redhat.com> - 1.3.1-2
+- use <mirrorOf>*</mirrorOf> now that Maven 2.0.8 is available in the buildroots
+- retrieve Maven info for a build from the top-level pom.xml in the source tree
+- allow specifying one or more Maven profiles to be used during a build
 
 * Fri Feb 20 2009 Mike McLean <mikem at redhat.com> 1.3.1-1
 - external repo urls rewritten to end with /

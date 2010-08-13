@@ -360,6 +360,8 @@ _TASKS = ['build',
           'buildSRPMFromSCM',
           'buildArch',
           'chainbuild',
+          'maven',
+          'buildMaven',
           'waitrepo',
           'tagBuild',
           'newRepo',
@@ -367,13 +369,14 @@ _TASKS = ['build',
           'buildNotification',
           'tagNotification',
           'dependantTask',
-          'createLiveCD']
+          'createLiveCD',
+          'createAppliance']
 # Tasks that can exist without a parent
-_TOPLEVEL_TASKS = ['build', 'buildNotification', 'chainbuild', 'newRepo', 'tagBuild', 'tagNotification', 'waitrepo', 'createLiveCD']
+_TOPLEVEL_TASKS = ['build', 'buildNotification', 'chainbuild', 'maven', 'newRepo', 'tagBuild', 'tagNotification', 'waitrepo', 'createLiveCD', 'createAppliance']
 # Tasks that can have children
-_PARENT_TASKS = ['build', 'chainbuild', 'newRepo']
+_PARENT_TASKS = ['build', 'chainbuild', 'maven', 'newRepo']
 
-def tasks(req, owner=None, state='active', view='tree', method='all', hostID=None, start=None, order='-id'):
+def tasks(req, owner=None, state='active', view='tree', method='all', hostID=None, channelID=None, start=None, order='-id'):
     values = _initValues(req, 'Tasks', 'tasks')
     server = _getServer(req)
 
@@ -444,6 +447,19 @@ def tasks(req, owner=None, state='active', view='tree', method='all', hostID=Non
     else:
         values['host'] = None
         values['hostID'] = None
+
+    if channelID:
+        try:
+            channelID = int(channelID)
+        except ValueError:
+            pass
+        channel = server.getChannel(channelID, strict=True)
+        opts['channel_id'] = channel['id']
+        values['channel'] = channel
+        values['channelID'] = channel['id']
+    else:
+        values['channel'] = None
+        values['channelID'] = None
 
     loggedInUser = req.currentUser
     values['loggedInUser'] = loggedInUser
@@ -523,7 +539,10 @@ def taskinfo(req, taskID):
     if task['method'] == 'buildArch':
         buildTag = server.getTag(params[1])
         values['buildTag'] = buildTag
-    elif task['method'] == 'createLiveCD':
+    elif task['method'] == 'buildMaven':
+        buildTag = params[1]
+        values['buildTag'] = buildTag
+    elif task['method'] == 'createLiveCD' or task['method'] == 'createAppliance':
         values['image'] = server.getImageInfo(taskID=taskID)
     elif task['method'] == 'buildSRPMFromSCM':
         if len(params) > 1:
@@ -553,6 +572,12 @@ def taskinfo(req, taskID):
     elif task['method'] == 'dependantTask':
         deps = [server.getTaskInfo(depID, request=True) for depID in params[0]]
         values['deps'] = deps
+    elif task['method'] == 'wrapperRPM':
+        buildTag = params[1]
+        values['buildTag'] = buildTag
+        if params[3]:
+            wrapTask = server.getTaskInfo(params[3]['id'], request=True)
+            values['wrapTask'] = wrapTask
     
     if task['state'] in (koji.TASK_STATES['CLOSED'], koji.TASK_STATES['FAILED']):
         try:
@@ -591,7 +616,11 @@ def imageinfo(req, imageID):
     values['title'] = image['filename'] + ' | Image Information'
     values['buildroot'] = server.getBuildroot(image['br_id'], strict=True)
     values['task'] = server.getTaskInfo(image['task_id'], request=True)
-    values['imageBase'] = imageURL + '/' + koji.pathinfo.livecdRelPath(image['id'])
+    if image['mediatype'] == 'LiveCD ISO':
+        values['imageBase'] = imageURL + '/' + koji.pathinfo.livecdRelPath(image['id'])
+    else:
+        values['imageBase'] = imageURL + '/' + koji.pathinfo.applianceRelPath(image['id'])
+
     return _genHTML(req, 'imageinfo.chtml')
 
 def taskstatus(req, taskID):
@@ -644,7 +673,9 @@ def getfile(req, taskID, name, offset=None, size=None):
         req.headers_out['Content-Disposition'] = 'attachment; filename=%s' % name
     elif name.endswith('.log'):
         req.content_type = 'text/plain'
-    elif name.endswith('.iso'):
+    elif name.endswith('.iso') or name.endswith('.raw') or \
+         name.endswith('.qcow') or name.endswith('.qcow2') or \
+         name.endswith('.vmx'):
         req.content_type = 'application/octet-stream'
         req.headers_out['Content-Disposition'] = 'attachment; filename=%s' % name
 
@@ -823,34 +854,31 @@ def tagcreate(req):
     server = _getServer(req)
     _assertLogin(req)
 
+    mavenEnabled = server.mavenEnabled()
+
     form = req.form
 
     if form.has_key('add'):
+        params = {}
         name = form['name'].value
-        arches = form['arches'].value
-        if form.has_key('locked'):
-            locked = True
-        else:
-            locked = False
+        params['arches'] = form['arches'].value
+        params['locked'] = bool(form.has_key('locked'))
         permission = form['permission'].value
-        if permission == 'none':
-            permission = None
-        else:
-            permission = int(permission)
+        if permission != 'none':
+            params['perm'] = int(permission)
+        if mavenEnabled:
+            params['maven_support'] = bool(form.has_key('maven_support'))
+            params['maven_include_all'] = bool(form.has_key('maven_include_all'))
 
-        server.createTag(name)
-        tag = server.getTag(name)
-        
-        if tag == None:
-            raise koji.GenericError, 'error creating tag "%s"' % name
+        tagID = server.createTag(name, **params)
 
-        server.editTag(tag['id'], name, arches, locked, permission)
-        
-        mod_python.util.redirect(req, 'taginfo?tagID=%i' % tag['id'])
+        mod_python.util.redirect(req, 'taginfo?tagID=%i' % tagID)
     elif form.has_key('cancel'):
         mod_python.util.redirect(req, 'tags')
     else:
         values = _initValues(req, 'Add Tag', 'tags')
+
+        values['mavenEnabled'] = mavenEnabled
 
         values['tag'] = None
         values['permissions'] = server.getAllPerms()
@@ -861,6 +889,8 @@ def tagedit(req, tagID):
     server = _getServer(req)
     _assertLogin(req)
 
+    mavenEnabled = server.mavenEnabled()
+
     tagID = int(tagID)
     tag = server.getTag(tagID)
     if tag == None:
@@ -869,22 +899,26 @@ def tagedit(req, tagID):
     form = req.form
 
     if form.has_key('save'):
-        name = form['name'].value
-        arches = form['arches'].value
-        locked = bool(form.has_key('locked'))
+        params = {}
+        params['name'] = form['name'].value
+        params['arches'] = form['arches'].value
+        params['locked'] = bool(form.has_key('locked'))
         permission = form['permission'].value
-        if permission == 'none':
-            permission = None
-        else:
-            permission = int(permission)
+        if permission != 'none':
+            params['perm'] = int(permission)
+        if mavenEnabled:
+            params['maven_support'] = bool(form.has_key('maven_support'))
+            params['maven_include_all'] = bool(form.has_key('maven_include_all'))
 
-        server.editTag(tag['id'], name, arches, locked, permission)
+        server.editTag2(tag['id'], **params)
         
         mod_python.util.redirect(req, 'taginfo?tagID=%i' % tag['id'])
     elif form.has_key('cancel'):
         mod_python.util.redirect(req, 'taginfo?tagID=%i' % tag['id'])
     else:
         values = _initValues(req, 'Edit Tag', 'tags')
+
+        values['mavenEnabled'] = mavenEnabled
 
         values['tag'] = tag
         values['permissions'] = server.getAllPerms()
@@ -996,11 +1030,16 @@ def buildinfo(req, buildID):
     tags.sort(_sortbyname)
     rpms = server.listBuildRPMs(build['id'])
     rpms.sort(_sortbyname)
+    mavenbuild = server.getMavenBuild(buildID)
+    archives = server.listArchives(build['id'], queryOpts={'order': 'filename'})
+    archivesByExt = {}
+    for archive in archives:
+        archivesByExt.setdefault(os.path.splitext(archive['filename'])[1][1:], []).append(archive)
 
     rpmsByArch = {}
     debuginfoByArch = {}
     for rpm in rpms:
-        if rpm['name'].endswith('-debuginfo') or rpm['name'].endswith('-debuginfo-common'):
+        if koji.is_debuginfo(rpm['name']):
             debuginfoByArch.setdefault(rpm['arch'], []).append(rpm)
         else:
             rpmsByArch.setdefault(rpm['arch'], []).append(rpm)
@@ -1061,6 +1100,10 @@ def buildinfo(req, buildID):
     values['rpmsByArch'] = rpmsByArch
     values['debuginfoByArch'] = debuginfoByArch
     values['task'] = task
+    values['mavenbuild'] = mavenbuild
+    values['archives'] = archives
+    values['archivesByExt'] = archivesByExt
+    
     values['noarch_log_dest'] = noarch_log_dest
     if req.currentUser:
         values['perms'] = server.getUserPerms(req.currentUser['id'])
@@ -1080,10 +1123,11 @@ def buildinfo(req, buildID):
             values['estCompletion'] = None
 
     values['downloadBase'] = req.get_options().get('KojiPackagesURL', 'http://localhost/packages')
+    values['mavenBase'] = req.get_options().get('KojiMavenURL', 'http://localhost/maven2')
 
     return _genHTML(req, 'buildinfo.chtml')
 
-def builds(req, userID=None, tagID=None, packageID=None, state=None, order='-build_id', start=None, prefix=None, inherited='1', latest='1'):
+def builds(req, userID=None, tagID=None, packageID=None, state=None, order='-build_id', start=None, prefix=None, inherited='1', latest='1', type=None):
     values = _initValues(req, 'Builds', 'builds')
     server = _getServer(req)
 
@@ -1129,6 +1173,13 @@ def builds(req, userID=None, tagID=None, packageID=None, state=None, order='-bui
     values['prefix'] = prefix
     
     values['order'] = order
+    if type == 'maven':
+        pass
+    elif type == 'all':
+        type = None
+    else:
+        type = None
+    values['type'] = type
 
     if tag:
         inherited = int(inherited)
@@ -1143,10 +1194,12 @@ def builds(req, userID=None, tagID=None, packageID=None, state=None, order='-bui
         # don't need to consider 'state' here, since only completed builds would be tagged
         builds = kojiweb.util.paginateResults(server, values, 'listTagged', kw={'tag': tag['id'], 'package': (package and package['name'] or None),
                                                                                 'owner': (user and user['name'] or None),
+                                                                                'type': type,
                                                                                 'inherit': bool(inherited), 'latest': bool(latest), 'prefix': prefix},
                                               start=start, dataName='builds', prefix='build', order=order)
     else:
         builds = kojiweb.util.paginateMethod(server, values, 'listBuilds', kw={'userID': (user and user['id'] or None), 'packageID': (package and package['id'] or None),
+                                                                               'type': type,
                                                                                'state': state, 'prefix': prefix},
                                              start=start, dataName='builds', prefix='build', order=order)
     
@@ -1241,21 +1294,66 @@ def rpminfo(req, rpmID, fileOrder='name', fileStart=None, buildrootOrder='-id', 
 
     return _genHTML(req, 'rpminfo.chtml')
 
-def fileinfo(req, rpmID, filename):
+def archiveinfo(req, archiveID, fileOrder='name', fileStart=None, buildrootOrder='-id', buildrootStart=None):
+    values = _initValues(req, 'Archive Info', 'builds')
+    server = _getServer(req)
+
+    archiveID = int(archiveID)
+    archive = server.getArchive(archiveID)
+    archive_type = server.getArchiveType(type_id=archive['type_id'])
+    build = server.getBuild(archive['build_id'])
+    maveninfo = server.getMavenArchive(archive['id'])
+    builtInRoot = None
+    if archive['buildroot_id'] != None:
+        builtInRoot = server.getBuildroot(archive['buildroot_id'])
+    files = kojiweb.util.paginateMethod(server, values, 'listArchiveFiles', args=[archive['id']],
+                                        start=fileStart, dataName='files', prefix='file', order=fileOrder)
+    buildroots = kojiweb.util.paginateMethod(server, values, 'listBuildroots', kw={'archiveID': archive['id']},
+                                             start=buildrootStart, dataName='buildroots', prefix='buildroot',
+                                             order=buildrootOrder)
+
+    values['title'] = archive['filename'] + ' | Archive Info'
+
+    values['archiveID'] = archive['id']
+    values['archive'] = archive
+    values['archive_type'] = archive_type
+    values['build'] = build
+    values['maveninfo'] = maveninfo
+    values['builtInRoot'] = builtInRoot
+    values['buildroots'] = buildroots
+
+    return _genHTML(req, 'archiveinfo.chtml')
+
+def fileinfo(req, filename, rpmID=None, archiveID=None):
     values = _initValues(req, 'File Info', 'builds')
     server = _getServer(req)
 
-    rpmID = int(rpmID)
-    rpm = server.getRPM(rpmID)
-    if not rpm:
-        raise koji.GenericError, 'invalid RPM ID: %i' % rpmID
-    file = server.getRPMFile(rpmID, filename)
-    if not file:
-        raise koji.GenericError, 'no file %s in RPM %i' % (filename, rpmID)
+    values['rpm'] = None
+    values['archive'] = None
+    
+    if rpmID:
+        rpmID = int(rpmID)
+        rpm = server.getRPM(rpmID)
+        if not rpm:
+            raise koji.GenericError, 'invalid RPM ID: %i' % rpmID
+        file = server.getRPMFile(rpm['id'], filename)
+        if not file:
+            raise koji.GenericError, 'no file %s in RPM %i' % (filename, rpmID)
+        values['rpm'] = rpm
+    elif archiveID:
+        archiveID = int(archiveID)
+        archive = server.getArchive(archiveID)
+        if not archive:
+            raise koji.GenericError, 'invalid archive ID: %i' % archiveID
+        file = server.getArchiveFile(archive['id'], filename)
+        if not file:
+            raise koji.GenericError, 'no file %s in archive %i' % (filename, archiveID)
+        values['archive'] = archive
+    else:
+        raise koji.GenericError, 'either rpmID or archiveID must be specified'
 
     values['title'] = file['name'] + ' | File Info'
 
-    values['rpm'] = rpm
     values['file'] = file
 
     return _genHTML(req, 'fileinfo.chtml')
@@ -1425,6 +1523,11 @@ def channelinfo(req, channelID):
 
     values['title'] = channel['name'] + ' | Channel Info'
 
+    states = [koji.TASK_STATES[s] for s in ('FREE', 'OPEN', 'ASSIGNED')]
+    values['taskCount'] = \
+            server.listTasks(opts={'channel_id': channelID, 'state': states},
+                             queryOpts={'countOnly': True})
+
     hosts = server.listHosts(channelID=channelID)
     hosts.sort(_sortbyname)
 
@@ -1500,6 +1603,32 @@ def rpmlist(req, type, buildrootID=None, imageID=None, start=None, order='nvr'):
     values['order'] = order
 
     return _genHTML(req, 'rpmlist.chtml')
+
+def archivelist(req, buildrootID, type, start=None, order='filename'):
+    values = _initValues(req, 'Archive List', 'hosts')
+    server = _getServer(req)
+
+    buildrootID = int(buildrootID)
+    buildroot = server.getBuildroot(buildrootID)
+    if buildroot == None:
+        raise koji.GenericError, 'unknown buildroot ID: %i' % buildrootID
+
+    archives = None
+    if type == 'component':
+        rpms = kojiweb.util.paginateMethod(server, values, 'listArchives', kw={'componentBuildrootID': buildroot['id']},
+                                           start=start, dataName='archives', prefix='archive', order=order)
+    elif type == 'built':
+        rpms = kojiweb.util.paginateMethod(server, values, 'listArchives', kw={'buildrootID': buildroot['id']},
+                                           start=start, dataName='archives', prefix='archive', order=order)
+    else:
+        raise koji.GenericError, 'invalid type: %s' % type
+
+    values['buildroot'] = buildroot
+    values['type'] = type
+
+    values['order'] = order
+
+    return _genHTML(req, 'archivelist.chtml')
 
 def buildtargets(req, start=None, order='name'):
     values = _initValues(req, 'Build Targets', 'buildtargets')
@@ -1949,7 +2078,8 @@ _infoURLs = {'package': 'packageinfo?packageID=%(id)i',
              'target': 'buildtargetinfo?targetID=%(id)i',
              'user': 'userinfo?userID=%(id)i',
              'host': 'hostinfo?hostID=%(id)i',
-             'rpm': 'rpminfo?rpmID=%(id)i'}
+             'rpm': 'rpminfo?rpmID=%(id)i',
+             'maven': 'archiveinfo?archiveID=%(id)i'}
 
 _VALID_SEARCH_CHARS = r"""a-zA-Z0-9"""
 _VALID_SEARCH_SYMS = r""" @.,_/\()%+-*?|[]^$"""

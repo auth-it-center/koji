@@ -4,6 +4,12 @@
 
 #include "includes/header.chtml"
 #set $nvrpath = '%(name)s/%(version)s/%(release)s' % $build
+#set $archiveurl = ''
+#if $mavenbuild
+#set $archiveurl = '%s/%s/%s/%s/%s' % ($mavenBase, $mavenbuild['group_id'].replace('.', '/'),
+                                       $mavenbuild['artifact_id'], $mavenbuild['version'],
+                                       $build['release'])
+#end if
 
   <h4>Information for build <a href="buildinfo?buildID=$build.id">$koji.buildLabel($build)</a></h4>
 
@@ -23,6 +29,17 @@
     <tr>
       <th>Epoch</th><td>$build.epoch</td>
     </tr>
+    #if $mavenbuild
+    <tr>
+      <th>Maven&nbsp;groupId</th><td>$mavenbuild.group_id</td>
+    </tr>
+    <tr>
+      <th>Maven&nbsp;artifactId</th><td>$mavenbuild.artifact_id</td>
+    </tr>
+    <tr>
+      <th>Maven&nbsp;version</th><td>$mavenbuild.version</td>
+    </tr>
+    #end if
     #if $summary
     <tr>
       <th>Summary</th><td class="rpmheader">$util.escapeHTML($summary)</td>
@@ -131,6 +148,34 @@
         #end if
       </td>
     </tr>
+    #if $archives
+    <tr>
+      <th>Archives</th>
+      <td class="container">
+	<table class="nested">
+	  #set $exts = $archivesByExt.keys()
+	  #for ext in $exts
+	  <tr>
+	    <th>$ext</th>
+	    <td>
+	      #if $mavenbuild and $ext == 'pom'
+	      (<a href="$downloadBase/$nvrpath/data/logs/maven2/">build logs</a>)
+	      #end if
+	    </td>
+	  </tr>
+	  #for $archive in $archivesByExt[$ext]
+	  <tr>
+	    <td/>
+	    <td>
+	      $archive.filename (<a href="archiveinfo?archiveID=$archive.id">info</a>) (<a href="$archiveurl/$archive.filename">download</a>)
+	    </td>
+	  </tr>
+	  #end for
+	  #end for
+	</table>
+      </td>
+    </tr>
+    #end if
     #if $changelog
     <tr>
       <th>Changelog</th>
