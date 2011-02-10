@@ -392,6 +392,7 @@ def load_config(req):
 
         ['MissingPolicyOk', 'boolean', True],
         ['EnableMaven', 'boolean', False],
+        ['EnableWin', 'boolean', False],
 
         ['LockOut', 'boolean', False],
         ['ServerOffline', 'boolean', False],
@@ -472,7 +473,11 @@ _default_policies = {
             has req_channel :: req
             is_child_task :: parent
             all :: use default
-            '''
+            ''',
+    'vm' : '''
+            has_perm admin win-admin :: allow
+            all :: deny
+           '''
 }
 
 def get_policy(opts, plugins):

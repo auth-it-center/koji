@@ -8,7 +8,7 @@
 %define release %{baserelease}
 %endif
 Name: koji
-Version: 1.4.0
+Version: 1.6.0
 Release: %{release}%{?dist}
 License: LGPLv2 and GPLv2+
 # koji.ssl libs (from plague) are GPLv2+
@@ -47,7 +47,11 @@ Group: Applications/Internet
 License: LGPLv2
 Requires: %{name} = %{version}-%{release}
 Requires: %{name}-hub = %{version}-%{release}
-Requires: python-qpid
+Requires: python-qpid >= 0.7
+%if 0%{?rhel} == 5
+Requires: python-ssl
+%endif
+Requires: cpio
 
 %description hub-plugins
 Plugins to the koji XMLRPC interface
@@ -80,6 +84,24 @@ Requires: createrepo >= 0.9.2
 %description builder
 koji-builder is the daemon that runs on build machines and executes
 tasks that come through the Koji system.
+
+%package vm
+Summary: Koji virtual machine management daemon
+Group: Applications/System
+License: LGPLv2
+Requires: %{name} = %{version}-%{release}
+Requires(post): /sbin/chkconfig
+Requires(post): /sbin/service
+Requires(preun): /sbin/chkconfig
+Requires(preun): /sbin/service
+Requires: libvirt-python
+Requires: libxml2-python
+Requires: python-virtinst
+Requires: qemu-img
+
+%description vm
+koji-vm contains a supplemental build daemon that executes certain tasks in a
+virtual machine. This package is not required for most installations.
 
 %package utils
 Summary: Koji Utilities
@@ -170,7 +192,6 @@ rm -rf $RPM_BUILD_ROOT
 %config(noreplace) %{_sysconfdir}/sysconfig/kojid
 %dir %{_sysconfdir}/kojid
 %config(noreplace) %{_sysconfdir}/kojid/kojid.conf
-%{_datadir}/koji-builder
 %attr(-,kojibuilder,kojibuilder) %{_sysconfdir}/mock/koji
 
 %pre builder
@@ -178,12 +199,30 @@ rm -rf $RPM_BUILD_ROOT
 
 %post builder
 /sbin/chkconfig --add kojid
-/sbin/service kojid condrestart &> /dev/null || :
 
 %preun builder
 if [ $1 = 0 ]; then
   /sbin/service kojid stop &> /dev/null
   /sbin/chkconfig --del kojid
+fi
+
+%files vm
+%defattr(-,root,root)
+%{_sbindir}/kojivmd
+#dir %{_datadir}/kojivmd
+%{_datadir}/kojivmd/kojikamid
+%{_initrddir}/kojivmd
+%config(noreplace) %{_sysconfdir}/sysconfig/kojivmd
+%dir %{_sysconfdir}/kojivmd
+%config(noreplace) %{_sysconfdir}/kojivmd/kojivmd.conf
+
+%post vm
+/sbin/chkconfig --add kojivmd
+
+%preun vm
+if [ $1 = 0 ]; then
+  /sbin/service kojivmd stop &> /dev/null
+  /sbin/chkconfig --del kojivmd
 fi
 
 %post utils
@@ -196,6 +235,33 @@ if [ $1 = 0 ]; then
 fi
 
 %changelog
+* Thu Dec 16 2010 Mike McLean <mikem at redhat.com> - 1.6.0-1
+- extend debuginfo check to cover newer formats
+- ignore tasks that TaskManager does not have a handler for
+- avoid possible traceback on ^c
+- graceful mass builder restart
+- no longer issue condrestart in postinstall scriptlet
+- fix ssl connections for python 2.7
+- more sanity checks on wait-repo arguments (ticket#192)
+- maven: only treat files ending in .patch as patch files
+- maven: retain ordering so more recent builds will take precedence
+- enable passing options to Maven
+- maven: use strict checksum checking
+
+* Thu Nov 11 2010 Mike McLean <mikem at redhat.com> - 1.5.0-1
+- koji vm daemon for executing certain tasks in virtual machine
+- major refactoring of koji daemons
+- support for complete history query (not just tag operations)
+- allow filtering tasks by channel in webui
+- rename-channel and remove-channel commands
+- clean up tagBuild checks (rhbz#616839)
+- resurrect import-comps command
+- utf8 encoding fixes
+- allow getfile to handle files > 2G
+- update the messagebus plugin to use the new qpid.messaging API
+- rpm2maven plugin: use Maven artifacts from rpm builds in Koji's Maven repos
+- log mock output
+
 * Thu Jul  8 2010 Mike McLean <mikem at redhat.com> - 1.4.0-1
 - Merge mead branch: support for building jars with Maven *
 - support for building appliance images *

@@ -2,6 +2,7 @@ import os
 import os.path
 import re
 import sys
+import mimetypes
 import mod_python
 import mod_python.Cookie
 import Cheetah.Filters
@@ -102,9 +103,10 @@ def _assertLogin(req):
         assert False
 
 def _getServer(req):
-    serverURL = req.get_options().get('KojiHubURL', 'http://localhost/kojihub')
-    session = koji.ClientSession(serverURL)
-    
+    opts = req.get_options()
+    session = koji.ClientSession(opts.get('KojiHubURL', 'http://localhost/kojihub'),
+                                 opts={'krbservice': opts.get('KrbService', 'host')})
+
     req.currentLogin = _getUserCookie(req)
     if req.currentLogin:
         req.currentUser = session.getUser(req.currentLogin)
@@ -113,7 +115,7 @@ def _getServer(req):
         _setUserCookie(req, req.currentLogin)
     else:
         req.currentUser = None
-    
+
     req._session = session
     return session
 
@@ -362,6 +364,9 @@ _TASKS = ['build',
           'chainbuild',
           'maven',
           'buildMaven',
+          'wrapperRPM',
+          'winbuild',
+          'vmExec',
           'waitrepo',
           'tagBuild',
           'newRepo',
@@ -372,9 +377,9 @@ _TASKS = ['build',
           'createLiveCD',
           'createAppliance']
 # Tasks that can exist without a parent
-_TOPLEVEL_TASKS = ['build', 'buildNotification', 'chainbuild', 'maven', 'newRepo', 'tagBuild', 'tagNotification', 'waitrepo', 'createLiveCD', 'createAppliance']
+_TOPLEVEL_TASKS = ['build', 'buildNotification', 'chainbuild', 'maven', 'wrapperRPM', 'winbuild', 'newRepo', 'tagBuild', 'tagNotification', 'waitrepo', 'createLiveCD', 'createAppliance']
 # Tasks that can have children
-_PARENT_TASKS = ['build', 'chainbuild', 'maven', 'newRepo']
+_PARENT_TASKS = ['build', 'chainbuild', 'maven', 'winbuild', 'newRepo']
 
 def tasks(req, owner=None, state='active', view='tree', method='all', hostID=None, channelID=None, start=None, order='-id'):
     values = _initValues(req, 'Tasks', 'tasks')
@@ -578,6 +583,8 @@ def taskinfo(req, taskID):
         if params[3]:
             wrapTask = server.getTaskInfo(params[3]['id'], request=True)
             values['wrapTask'] = wrapTask
+    elif task['method'] == 'restartVerify':
+        values['rtask'] = server.getTaskInfo(params[0], request=True)
     
     if task['state'] in (koji.TASK_STATES['CLOSED'], koji.TASK_STATES['FAILED']):
         try:
@@ -667,16 +674,16 @@ def getfile(req, taskID, name, offset=None, size=None):
     file_info = output.get(name)
     if not file_info:
         raise koji.GenericError, 'no file "%s" output by task %i' % (name, taskID)
-    
-    if name.endswith('.rpm'):
-        req.content_type = 'application/x-rpm'
-        req.headers_out['Content-Disposition'] = 'attachment; filename=%s' % name
-    elif name.endswith('.log'):
-        req.content_type = 'text/plain'
-    elif name.endswith('.iso') or name.endswith('.raw') or \
-         name.endswith('.qcow') or name.endswith('.qcow2') or \
-         name.endswith('.vmx'):
-        req.content_type = 'application/octet-stream'
+
+    mime_guess = mimetypes.guess_type(name, strict=False)[0]
+    if mime_guess:
+        req.content_type = mime_guess
+    else:
+        if name.endswith('.log') or name.endswith('.ks'):
+            req.content_type = 'text/plain'
+        else:
+            req.content_type = 'application/octet-stream'
+    if req.content_type != 'text/plain':
         req.headers_out['Content-Disposition'] = 'attachment; filename=%s' % name
 
     file_size = int(file_info['st_size'])
@@ -709,7 +716,11 @@ def getfile(req, taskID, name, offset=None, size=None):
         chunk_size = 1048576
         if remaining < chunk_size:
             chunk_size = remaining
+        if offset > 2147483647:
+            offset = str(offset)
         content = server.downloadTaskOutput(taskID, name, offset=offset, size=chunk_size)
+        if isinstance(offset, str):
+            offset = int(offset)
         if not content:
             break
         req.write(content)
@@ -1031,7 +1042,14 @@ def buildinfo(req, buildID):
     rpms = server.listBuildRPMs(build['id'])
     rpms.sort(_sortbyname)
     mavenbuild = server.getMavenBuild(buildID)
-    archives = server.listArchives(build['id'], queryOpts={'order': 'filename'})
+    winbuild = server.getWinBuild(buildID)
+    if mavenbuild:
+        archivetype = 'maven'
+    elif winbuild:
+        archivetype = 'win'
+    else:
+        archivetype = None
+    archives = server.listArchives(build['id'], type=archivetype, queryOpts={'order': 'filename'})
     archivesByExt = {}
     for archive in archives:
         archivesByExt.setdefault(os.path.splitext(archive['filename'])[1][1:], []).append(archive)
@@ -1101,6 +1119,7 @@ def buildinfo(req, buildID):
     values['debuginfoByArch'] = debuginfoByArch
     values['task'] = task
     values['mavenbuild'] = mavenbuild
+    values['winbuild'] = winbuild
     values['archives'] = archives
     values['archivesByExt'] = archivesByExt
     
@@ -1173,7 +1192,7 @@ def builds(req, userID=None, tagID=None, packageID=None, state=None, order='-bui
     values['prefix'] = prefix
     
     values['order'] = order
-    if type == 'maven':
+    if type in ('maven', 'win'):
         pass
     elif type == 'all':
         type = None
@@ -1302,7 +1321,12 @@ def archiveinfo(req, archiveID, fileOrder='name', fileStart=None, buildrootOrder
     archive = server.getArchive(archiveID)
     archive_type = server.getArchiveType(type_id=archive['type_id'])
     build = server.getBuild(archive['build_id'])
-    maveninfo = server.getMavenArchive(archive['id'])
+    maveninfo = False
+    if 'group_id' in archive:
+        maveninfo = True
+    wininfo = False
+    if 'relpath' in archive:
+        wininfo = True
     builtInRoot = None
     if archive['buildroot_id'] != None:
         builtInRoot = server.getBuildroot(archive['buildroot_id'])
@@ -1319,6 +1343,7 @@ def archiveinfo(req, archiveID, fileOrder='name', fileStart=None, buildrootOrder
     values['archive_type'] = archive_type
     values['build'] = build
     values['maveninfo'] = maveninfo
+    values['wininfo'] = wininfo
     values['builtInRoot'] = builtInRoot
     values['buildroots'] = buildroots
 
@@ -2079,7 +2104,8 @@ _infoURLs = {'package': 'packageinfo?packageID=%(id)i',
              'user': 'userinfo?userID=%(id)i',
              'host': 'hostinfo?hostID=%(id)i',
              'rpm': 'rpminfo?rpmID=%(id)i',
-             'maven': 'archiveinfo?archiveID=%(id)i'}
+             'maven': 'archiveinfo?archiveID=%(id)i',
+             'win': 'archiveinfo?archiveID=%(id)i'}
 
 _VALID_SEARCH_CHARS = r"""a-zA-Z0-9"""
 _VALID_SEARCH_SYMS = r""" @.,_/\()%+-*?|[]^$"""
@@ -2125,6 +2151,13 @@ def search(req, start=None, order='name'):
             # (you're feeling lucky)
             mod_python.util.redirect(req, infoURL % results[0])
         else:
+            if type == 'maven':
+                typeLabel = 'Maven artifacts'
+            elif type == 'win':
+                typeLabel = 'Windows artifacts'
+            else:
+                typeLabel = '%ss' % type
+            values['typeLabel'] = typeLabel
             return _genHTML(req, 'searchresults.chtml')
     else:
         return _genHTML(req, 'search.chtml')

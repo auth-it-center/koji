@@ -159,6 +159,7 @@ def get_options():
         'offline_retry' : None,
         'offline_retry_interval' : None,
         'poll_interval': 5,
+        'krbservice': 'host',
         'cert': '~/.koji/client.crt',
         'ca': '~/.koji/clientca.crt',
         'serverca': '~/.koji/serverca.crt', 
@@ -321,6 +322,10 @@ class TaskWatcher(object):
         return (state == 'CLOSED')
 
     def display_state(self, info):
+        # We can sometimes be passed a task that is not yet open, but
+        # not finished either.  info would be none.
+        if not info:
+            return 'unknown'
         if info['state'] == koji.TASK_STATES['OPEN']:
             if info['host_id']:
                 host = self.session.getHost(info['host_id'])
@@ -924,6 +929,9 @@ def handle_maven_build(options, session, args):
     parser = OptionParser(usage=usage)
     parser.add_option("--patches", action="store", metavar="URL",
                       help=_("SCM URL of a directory containing patches to apply to the sources before building"))
+    parser.add_option("-G", "--goal", action="append",
+                      dest="goals", metavar="GOAL", default=[],
+                      help=_("Additional goal to run before \"deploy\""))
     parser.add_option("-P", "--profile", action="append",
                       dest="profiles", metavar="PROFILE", default=[],
                       help=_("Enable a profile for the Maven build"))
@@ -933,6 +941,11 @@ def handle_maven_build(options, session, args):
     parser.add_option("-J", "--jvm-option", action="append",
                       dest="jvm_options", metavar="OPTION", default=[],
                       help=_("Pass a command-line option to the JVM"))
+    parser.add_option("-M", "--maven-option", action="append",
+                      dest="maven_options", metavar="OPTION", default=[],
+                      help=_("Pass a command-line option to Maven"))
+    parser.add_option("--debug", action="store_true",
+                      help=_("Run Maven build in debug mode"))
     parser.add_option("--specfile", action="store", metavar="URL",
                       help=_("SCM URL of a spec file fragment to use to generate wrapper RPMs"))
     parser.add_option("--skip-tag", action="store_true",
@@ -964,7 +977,9 @@ def handle_maven_build(options, session, args):
         parser.error(_("Invalid SCM URL: %s" % source))
         assert False
     opts = {}
-    for key in ('skip_tag', 'scratch', 'specfile', 'patches', 'profiles', 'jvm_options'):
+    if build_opts.debug:
+        build_opts.maven_options.append('--debug')
+    for key in ('skip_tag', 'scratch', 'specfile', 'patches', 'goals', 'profiles', 'jvm_options', 'maven_options'):
         val = getattr(build_opts, key)
         if val:
             opts[key] = val
@@ -1222,6 +1237,29 @@ def handle_enable_host(options, session, args):
         if options.comment is not None:
             session.editHost(host, comment=options.comment)
     session.multiCall(strict=True)
+
+
+def handle_restart_hosts(options, session, args):
+    "[admin] Restart enabled hosts"
+    usage = _("usage: %prog restart-hosts [options]")
+    usage += _("\n(Specify the --help global option for a list of other help options)")
+    parser = OptionParser(usage=usage)
+    parser.add_option("--wait", action="store_true",
+                      help=_("Wait on the task, even if running in the background"))
+    parser.add_option("--nowait", action="store_false", dest="wait",
+                      help=_("Don't wait on task"))
+    parser.add_option("--quiet", action="store_true",
+                      help=_("Do not print the task information"), default=options.quiet)
+    (my_opts, args) = parser.parse_args(args)
+
+    activate_session(session)
+    task_id = session.restartHosts()
+    if my_opts.wait or (my_opts.wait is None and not _running_in_bg()):
+        session.logout()
+        return watch_tasks(session, [task_id], quiet=my_opts.quiet)
+    else:
+        return
+
 
 def handle_import(options, session, args):
     "[admin] Import externally built RPMs into the database"
@@ -1811,7 +1849,8 @@ def handle_list_permissions(options, session, args):
     usage = _("usage: %prog list-permissions [options]")
     usage += _("\n(Specify the --help global option for a list of other help options)")
     parser = OptionParser(usage=usage)
-    parser.add_option("--user", help=_("Only list permissions for this user"))
+    parser.add_option("--user", help=_("List permissions for the given user"))
+    parser.add_option("--mine", action="store_true", help=_("List your permissions"))
     (options, args) = parser.parse_args(args)
     if len(args) > 0:
         parser.error(_("This command takes no arguments"))
@@ -1823,6 +1862,8 @@ def handle_list_permissions(options, session, args):
             print "User %s does not exist" % options.user
             return 1
         perms = session.getUserPerms(user['id'])
+    elif options.mine:
+        perms = session.getPerms()
     else:
         perms = [p['name'] for p in session.getAllPerms()]
     for perm in perms:
@@ -1980,9 +2021,10 @@ def handle_import_archive(options, session, args):
     parser.add_option("--noprogress", action="store_true",
                       help=_("Do not display progress of the upload"))
     parser.add_option("--create-build", action="store_true", help=_("Auto-create builds as needed"))
-    parser.add_option("--type", help=_("The type of archive we're importing.  Currently supported types: maven"))
+    parser.add_option("--type", help=_("The type of archive being imported.  Currently supported types: maven, win"))
     parser.add_option("--type-info", help=_("Type-specific information to associate with the archives.  "
-                                            "For Maven archives this should be a local path to a .pom file."))
+                                            "For Maven archives this should be a local path to a .pom file.  "
+                                            "For Windows archives this should be relpath:platforms[:flags]))"))
     (suboptions, args) = parser.parse_args(args)
 
     if not len(args) > 1:
@@ -2004,14 +2046,30 @@ def handle_import_archive(options, session, args):
         pom_info = koji.parse_pom(suboptions.type_info)
         maven_info = koji.pom_to_maven_info(pom_info)
         suboptions.type_info = maven_info
+    elif suboptions.type == 'win':
+        if not (session.hasPerm('win-import') or session.hasPerm('admin')):
+            parser.error(_("This action requires the win-import privilege"))
+            assert False
+        if not suboptions.type_info:
+            parser.error(_("--type-info must be specified"))
+            assert False
+        type_info = suboptions.type_info.split(':', 2)
+        if len(type_info) < 2:
+            parser.error(_("--type-info must be in relpath:platforms[:flags] format"))
+        win_info = {'relpath': type_info[0], 'platforms': type_info[1].split()}
+        if len(type_info) > 2:
+            win_info['flags'] = type_info[2].split()
+        else:
+            win_info['flags'] = []
+        suboptions.type_info = win_info
     else:
         parser.error(_("Unsupported archive type: %s" % suboptions.type))
         assert False
 
-    needs_create = False
-
     buildinfo = session.getBuild(arg_filter(args[0]))
     if not buildinfo:
+        if not suboptions.create_build:
+            parser.error(_("No such build: %s") % args[0])
         buildinfo = koji.parse_NVR(args[0])
         if buildinfo['epoch'] == '':
             buildinfo['epoch'] = None
@@ -2020,6 +2078,10 @@ def handle_import_archive(options, session, args):
         if suboptions.type == 'maven':
             # --type-info should point to a local .pom file
             session.createMavenBuild(buildinfo, suboptions.type_info)
+        elif suboptions.type == 'win':
+            # We're importing, so we don't know what platform the build
+            # was run on.  Use "import" as a placeholder.
+            session.createWinBuild(buildinfo, {'platform': 'import'})
         else:
             # should get caught above
             assert False
@@ -2725,26 +2787,46 @@ def anon_handle_buildinfo(options, session, args):
         if info is None:
             print "No such build: %s\n" % build
             continue
+        task = None
+        if info['task_id']:
+            task = session.getTaskInfo(info['task_id'], request=True)
         taglist = []
         for tag in session.listTags(build):
             taglist.append(tag['name'])
-        if info['epoch'] is None:
-            info['epoch'] = ""
-        else:
-            info['epoch'] = str(info['epoch']) + ":"
-        info['name'] = info['package_name']
         info['arch'] = 'src'
         info['state'] = koji.BUILD_STATES[info['state']]
-        rpms = session.listRPMs(buildID=info['id'])
         print "BUILD: %(name)s-%(version)s-%(release)s [%(id)d]" % info
         print "State: %(state)s" % info
         print "Built by: %(owner_name)s" % info
-        print "Task: %(task_id)s" % info
+        if task:
+            print "Task: %s %s" % (task['id'], koji.taskLabel(task))
+        else:
+            print "Task: none"
         print "Finished: %s" % koji.formatTimeLong(info['completion_time'])
+        maven_info = session.getMavenBuild(info['id'])
+        if maven_info:
+            print "Maven groupId: %s" % maven_info['group_id']
+            print "Maven artifactId: %s" % maven_info['artifact_id']
+            print "Maven version: %s" % maven_info['version']
+        win_info = session.getWinBuild(info['id'])
+        if win_info:
+            print "Windows build platform: %s" % win_info['platform']
         print "Tags: %s" % ' '.join(taglist)
-        print "RPMs:"
-        for rpm in rpms:
-            print os.path.join(koji.pathinfo.build(info), koji.pathinfo.rpm(rpm))
+        maven_archives = session.listArchives(buildID=info['id'], type='maven')
+        if maven_archives:
+            print "Maven archives:"
+            for archive in maven_archives:
+                print os.path.join(koji.pathinfo.mavenbuild(info, maven_info), archive['filename'])
+        win_archives = session.listArchives(buildID=info['id'], type='win')
+        if win_archives:
+            print "Windows archives:"
+            for archive in win_archives:
+                print os.path.join(koji.pathinfo.winbuild(info), koji.pathinfo.winfile(archive))
+        rpms = session.listRPMs(buildID=info['id'])
+        if rpms:
+            print "RPMs:"
+            for rpm in rpms:
+                print os.path.join(koji.pathinfo.build(info), koji.pathinfo.rpm(rpm))
         if options.changelog:
             changelog = session.getChangelogEntries(info['id'])
             if changelog:
@@ -3365,6 +3447,303 @@ def anon_handle_list_tag_history(options, session, args):
             print "%r" % x
         print _histline(event_id, x)
 
+def _print_histline(entry, **kwargs):
+    options = kwargs['options']
+    event_id, table, create, x = entry
+    who = None
+    edit = x.get('.related')
+    if edit:
+        del x['.related']
+        bad_edit = None
+        if len(edit) != 1:
+            bad_edit = "%i elements" % len(edit)+1
+        other = edit[0]
+        #check edit for sanity
+        if create or not other[2]:
+            bad_edit = "out of order"
+        if event_id != other[0]:
+            bad_edit = "non-matching"
+        if bad_edit:
+            print "Warning: unusual edit at event %i in table %s (%s)" % (event_id, table, bad_edit)
+            #we'll simply treat them as separate events
+            pprint.pprint(entry)
+            pprint.pprint(edit)
+            _print_histline(entry, **kwargs)
+            for data in edit:
+                _print_histline(entry, **kwargs)
+            return
+    if create:
+        ts = x['create_ts']
+        if x.has_key('creator_name'):
+            who = "by %(creator_name)s"
+    else:
+        ts = x['revoke_ts']
+        if x.has_key('revoker_name'):
+            who = "by %(revoker_name)s"
+    if table == 'tag_listing':
+        if edit:
+            fmt = "%(name)s-%(version)s-%(release)s re-tagged into %(tag.name)s"
+        elif create:
+            fmt = "%(name)s-%(version)s-%(release)s tagged into %(tag.name)s"
+        else:
+            fmt = "%(name)s-%(version)s-%(release)s untagged from %(tag.name)s"
+    elif table == 'user_perms':
+        if edit:
+            fmt = "permission %(permission.name)s re-granted to %(user.name)s"
+        elif create:
+            fmt = "permission %(permission.name)s granted to %(user.name)s"
+        else:
+            fmt = "permission %(permission.name)s revoked for %(user.name)s"
+    elif table == 'user_groups':
+        if edit:
+            fmt = "user %(user.name)s re-added to group %(group.name)s"
+        elif create:
+            fmt = "user %(user.name)s added to group %(group.name)s"
+        else:
+            fmt = "user %(user.name)s removed from group %(group.name)s"
+    elif table == 'tag_packages':
+        if edit:
+            fmt = "package list entry for %(package.name)s in %(tag.name)s updated"
+        elif create:
+            fmt = "package list entry created: %(package.name)s in %(tag.name)s"
+        else:
+            fmt = "package list entry revoked: %(package.name)s in %(tag.name)s"
+    elif table == 'tag_inheritance':
+        if edit:
+            fmt = "inheritance line %(tag.name)s->%(parent.name)s updated"
+        elif create:
+            fmt = "inheritance line %(tag.name)s->%(parent.name)s added"
+        else:
+            fmt = "inheritance line %(tag.name)s->%(parent.name)s removed"
+    elif table == 'tag_config':
+        if edit:
+            fmt = "tag configuration for %(tag.name)s altered"
+        elif create:
+            fmt = "new tag: %(tag.name)s"
+        else:
+            fmt = "tag deleted: %(tag.name)s"
+    elif table == 'build_target_config':
+        if edit:
+            fmt = "build target configuration for %(build_target.name)s updated"
+        elif create:
+            fmt = "new build target: %(build_target.name)s"
+        else:
+            fmt = "build target deleted: %(build_target.name)s"
+    elif table == 'external_repo_config':
+        if edit:
+            fmt = "external repo configuration for %(external_repo.name)s altered"
+        elif create:
+            fmt = "new external repo: %(external_repo.name)s"
+        else:
+            fmt = "external repo deleted: %(external_repo.name)s"
+    elif table == 'tag_external_repos':
+        if edit:
+            fmt = "external repo entry for %(external_repo.name)s in tag %(tag.name)s updated"
+        elif create:
+            fmt = "external repo entry for %(external_repo.name)s added to tag %(tag.name)s"
+        else:
+            fmt = "external repo entry for %(external_repo.name)s removed from tag %(tag.name)s"
+    elif table == 'group_config':
+        if edit:
+            fmt = "group %(group.name)s configuration for tag %(tag.name)s updated"
+        elif create:
+            fmt = "group %(group.name)s added to tag %(tag.name)s"
+        else:
+            fmt = "group %(group.name)s removed from tag %(tag.name)s"
+    elif table == 'group_req_listing':
+        if edit:
+            fmt = "group dependency %(group.name)s->%(req.name)s updated in tag %(tag.name)s"
+        elif create:
+            fmt = "group dependency %(group.name)s->%(req.name)s added in tag %(tag.name)s"
+        else:
+            fmt = "group dependency %(group.name)s->%(req.name)s dropped from tag %(tag.name)s"
+    elif table == 'group_package_listing':
+        if edit:
+            fmt = "package entry %(package)s in group %(group.name)s, tag %(tag.name)s updated"
+        elif create:
+            fmt = "package %(package)s added to group %(group.name)s in tag %(tag.name)s"
+        else:
+            fmt = "package %(package)s removed from group %(group.name)s in tag %(tag.name)s"
+    else:
+        if edit:
+            fmt = "%s entry updated" % table
+        elif create:
+            fmt = "%s entry created" % table
+        else:
+            fmt = "%s entry revoked" % table
+    time_str = time.asctime(time.localtime(ts))
+    parts  = [time_str, fmt % x]
+    if options.events or options.verbose:
+        parts.insert(1, "(eid %i)" % event_id)
+    if who:
+        parts.append(who % x)
+    if create and x['active']:
+        parts.append("[still active]")
+    print ' '.join(parts)
+    hidden_fields = ['active', 'create_event', 'revoke_event', 'creator_id', 'revoker_id',
+                     'creator_name', 'revoker_name', 'create_ts', 'revoke_ts']
+    def get_nkey(key):
+        if key == 'perm_id':
+            return 'permission.name'
+        elif key.endswith('_id'):
+            return '%s.name' % key[:-3]
+        else:
+            return '%s.name' % key
+    if edit:
+        keys = x.keys()
+        keys.sort()
+        y = other[-1]
+        for key in keys:
+            if key in hidden_fields:
+                continue
+            if x[key] == y[key]:
+                continue
+            if key[0] == '_':
+                continue
+            nkey = get_nkey(key)
+            if nkey in x and nkey in y:
+                continue
+            print "    %s: %s -> %s" % (key, x[key], y[key])
+    elif create and options.verbose and table != 'tag_listing':
+        keys = x.keys()
+        keys.sort()
+        # the table keys have already been represented in the base format string
+        also_hidden = list(_table_keys[table])
+        also_hidden.extend([get_nkey(k) for k in also_hidden])
+        for key in keys:
+            if key in hidden_fields or key in also_hidden:
+                continue
+            nkey = get_nkey(key)
+            if nkey in x:
+                continue
+            if key[0] == '_':
+                continue
+            if x.get('blocked') and key != 'blocked':
+                continue
+            if key.endswith('.name'):
+                dkey = key[:-5]
+            else:
+                dkey = key
+            print "    %s: %s" % (dkey, x[key])
+
+_table_keys = {
+    'user_perms' : ['user_id', 'perm_id'],
+    'user_groups' : ['user_id', 'group_id'],
+    'tag_inheritance' : ['tag_id', 'parent_id'],
+    'tag_config' : ['tag_id'],
+    'build_target_config' : ['build_target_id'],
+    'external_repo_config' : ['external_repo_id'],
+    'tag_external_repos' : ['tag_id', 'external_repo_id'],
+    'tag_listing' : ['build_id', 'tag_id'],
+    'tag_packages' : ['package_id', 'tag_id'],
+    'group_config' : ['group_id', 'tag_id'],
+    'group_req_listing' : ['group_id', 'tag_id', 'req_id'],
+    'group_package_listing' : ['group_id', 'tag_id', 'package'],
+    }
+
+def anon_handle_list_history(options, session, args):
+    "Display historical data"
+    usage = _("usage: %prog list-tag-history [options]")
+    usage += _("\n(Specify the --help global option for a list of other help options)")
+    parser = OptionParser(usage=usage)
+    parser.add_option("--debug", action="store_true")
+    parser.add_option("--build", help=_("Only show data for a specific build"))
+    parser.add_option("--package", help=_("Only show data for a specific package"))
+    parser.add_option("--tag", help=_("Only show data for a specific tag"))
+    parser.add_option("--editor", "--by", metavar="USER", help=_("Only show entries modified by user"))
+    parser.add_option("--user", help=_("Only show entries affecting a user"))
+    parser.add_option("--permission", help=_("Only show entries relating to a given permission"))
+    parser.add_option("--external-repo", "--erepo", help=_("Only show entries relating to a given external repo"))
+    parser.add_option("--build-target", "--target", help=_("Only show entries relating to a given build target"))
+    parser.add_option("--group", help=_("Only show entries relating to a given group"))
+    parser.add_option("--before", metavar="TIMESTAMP", help=_("Only show entries before timestamp"))
+    parser.add_option("--after", metavar="TIMESTAMP", help=_("Only show entries after timestamp"))
+    parser.add_option("--before-event", metavar="EVENT_ID", type='int', help=_("Only show entries before event"))
+    parser.add_option("--after-event", metavar="EVENT_ID", type='int', help=_("Only show entries after event"))
+    parser.add_option("--context", action="store_true", help=_("Show related entries"))
+    parser.add_option("-s", "--show", action="append", help=_("Show data from selected tables"))
+    parser.add_option("-v", "--verbose", action="store_true", help=_("Show more detail"))
+    parser.add_option("-e", "--events", action="store_true", help=_("Show event ids"))
+    parser.add_option("--all", action="store_true", help=_("Allows listing the entire global history"))
+    (options, args) = parser.parse_args(args)
+    if len(args) != 0:
+        parser.error(_("This command takes no arguments"))
+        assert False
+    kwargs = {}
+    limited = False
+    for opt in 'package', 'tag', 'build', 'editor', 'user', 'permission', 'external_repo', \
+               'build_target', 'group', 'before', 'after':
+        val = getattr(options, opt)
+        if val:
+            kwargs[opt] = val
+            limited = True
+    if options.before_event:
+        kwargs['beforeEvent'] = options.before_event
+    if options.after_event:
+        kwargs['afterEvent'] = options.after_event
+    tables = None
+    if options.show:
+        tables = []
+        for arg in options.show:
+            tables.extend(arg.split(','))
+    if not limited and not options.all:
+        parser.error(_("Please specify an option to limit the query"))
+
+    activate_session(session)
+
+    histdata = session.queryHistory(tables=tables, **kwargs)
+    timeline = []
+    def distinguish_match(x, name):
+        """determine if create or revoke event matched"""
+        if options.context:
+            return True
+        name = "_" + name
+        ret = True
+        for key in x:
+            if key.startswith(name):
+                ret = ret and x[key]
+        return ret
+    for table in histdata:
+        hist = histdata[table]
+        for x in hist:
+            if x['revoke_event'] is not None:
+                if distinguish_match(x, 'revoked'):
+                    timeline.append((x['revoke_event'], table, 0, x.copy()))
+                #pprint.pprint(timeline[-1])
+            if distinguish_match(x, 'created'):
+                timeline.append((x['create_event'], table, 1, x))
+    timeline.sort()
+    #group edits together
+    new_timeline = []
+    last_event = None
+    edit_index = {}
+    for entry in timeline:
+        event_id, table, create, x = entry
+        if event_id != last_event:
+            edit_index = {}
+            last_event = event_id
+        key = tuple([x[k] for k in _table_keys[table]])
+        prev = edit_index.get((table, event_id), {}).get(key)
+        if prev:
+            prev[-1].setdefault('.related', []).append(entry)
+        else:
+            edit_index.setdefault((table, event_id), {})[key] = entry
+            new_timeline.append(entry)
+    for entry in new_timeline:
+        if options.debug:
+            print "%r" % list(entry)
+        _print_histline(entry, options=options)
+
+def _handleMap(lines, data, prefix=''):
+    for key, val in data.items():
+        if key != '__starstar':
+            lines.append('  %s%s: %s' % (prefix, key, val))
+
+def _handleOpts(lines, opts, prefix=''):
+    if opts:
+        lines.append("%sOptions:" % prefix)
+        _handleMap(lines, opts, prefix)
+
 def _parseTaskParams(session, method, task_id):
     """Parse the return of getTaskRequest()"""
     params = session.getTaskRequest(task_id)
@@ -3381,9 +3760,7 @@ def _parseTaskParams(session, method, task_id):
         lines.append("Build Arch: %s" % params[2])
         lines.append("SRPM Kept: %r" % params[3])
         if len(params) > 4:
-            for key in params[4].keys():
-                if not key == '__starstar':
-                    lines.append("%s: %s" % (key, params[4][key]))
+            _handleOpts(lines, params[4])
     elif method == 'tagBuild':
         build = session.getBuild(params[1])
         lines.append("Destination Tag: %s" % session.getTag(params[0])['name'])
@@ -3398,9 +3775,49 @@ def _parseTaskParams(session, method, task_id):
     elif method == 'build':
         lines.append("Source: %s" % params[0])
         lines.append("Build Target: %s" % params[1])
-        for key in params[2].keys():
-            if not key == '__starstar':
-                lines.append("%s: %s" % (key, params[2][key]))
+        if len(params) > 2:
+            _handleOpts(lines, params[2])
+    elif method == 'maven':
+        lines.append("SCM URL: %s" % params[0])
+        lines.append("Build Target: %s" % params[1])
+        if len(params) > 2:
+            _handleOpts(lines, params[2])
+    elif method == 'buildMaven':
+        lines.append("SCM URL: %s" % params[0])
+        lines.append("Build Tag: %s" % params[1]['name'])
+        if len(params) > 2:
+            _handleOpts(lines, params[2])
+    elif method == 'wrapperRPM':
+        lines.append("Spec File URL: %s" % params[0])
+        lines.append("Build Tag: %s" % params[1]['name'])
+        if params[2]:
+            lines.append("Build: %s" % koji.buildLabel(params[2]))
+        if params[3]:
+            lines.append("Task: %s %s" % (params[3]['id'], koji.taskLabel(params[3])))
+        if len(params) > 4:
+            _handleOpts(lines, params[4])
+    elif method == 'winbuild':
+        lines.append("VM: %s" % params[0])
+        lines.append("SCM URL: %s" % params[1])
+        lines.append("Build Target: %s" % params[2])
+        if len(params) > 3:
+            _handleOpts(lines, params[3])
+    elif method == 'vmExec':
+        lines.append("VM: %s" % params[0])
+        lines.append("Exec Params:")
+        for info in params[1]:
+            if isinstance(info, dict):
+                _handleMap(lines, info, prefix='  ')
+            else:
+                lines.append("  %s" % info)
+        if len(params) > 2:
+            _handleOpts(lines, params[2])
+    elif method in ('createLiveCD', 'createAppliance'):
+        lines.append("Arch: %s" % params[0])
+        lines.append("Build Target: %s" % params[1])
+        lines.append("Kickstart File: %s" % params[2])
+        if len(params) > 3:
+            _handleOpts(lines, params[3])
     elif method == 'newRepo':
         tag = session.getTag(params[0])
         lines.append("Tag: %s" % tag['name'])
@@ -3440,11 +3857,8 @@ def _parseTaskParams(session, method, task_id):
             lines.append("  Method: %s" % subtask[0])
             lines.append("  Parameters: %s" % ", ".join([str(subparam) for subparam in subtask[1]]))
             if len(subtask) > 2 and subtask[2]:
-                lines.append("  Options:")
                 subopts = subtask[2]
-                for key in subopts:
-                    if not key == '__starstar':
-                        lines.append("    %s: %s" % (key, subopts[key]))
+                _handleOpts(lines, subopts, prefix='  ')
             lines.append("")
     elif method == 'chainbuild':
         lines.append("Build Groups:")
@@ -3453,9 +3867,8 @@ def _parseTaskParams(session, method, task_id):
             group_num += 1
             lines.append("  %i: %s" % (group_num, ', '.join(group_list)))
         lines.append("Build Target: %s" % params[1])
-        for key in params[2].keys():
-            if not key == '__starstar':
-                lines.append("%s: %s" % (key, params[2][key]))
+        if len(params) > 2:
+            _handleOpts(lines, params[2])
     elif method == 'waitrepo':
         lines.append("Build Target: %s" % params[0])
         if params[1]:
@@ -3515,14 +3928,15 @@ def _printTaskInfo(session, task_id, level=0, recurse=True, verbose=True):
     if output:
         print "%sOutput:" % indent
         for filename in output:
-            print "%s %s/%s" % (indent, files_dir, filename)
+            print "%s  %s/%s" % (indent, files_dir, filename)
 
     # white space
-    sys.stdout.write("\n")
+    print
 
     if recurse:
         level += 1
-        children = session.getTaskChildren(task_id)
+        children = session.getTaskChildren(task_id, request=True)
+        children.sort(cmp=lambda a, b: cmp(a['id'], b['id']))
         for child in children:
             _printTaskInfo(session, child['id'], level, verbose=verbose)
 
@@ -3531,7 +3945,7 @@ def anon_handle_taskinfo(options, session, args):
     usage = _("usage: %prog taskinfo [options] taskID [taskID...]")
     usage += _("\n(Specify the --help global option for a list of other help options)")
     parser = OptionParser(usage=usage)
-    parser.add_option("--recurse", action="store_true", help=_("Show children of this task as well"))
+    parser.add_option("-r", "--recurse", action="store_true", help=_("Show children of this task as well"))
     parser.add_option("-v", "--verbose", action="store_true", help=_("Be verbose"))
     (options, args) = parser.parse_args(args)
     if len(args) < 1:
@@ -4134,8 +4548,8 @@ def handle_add_external_repo(options, session, args):
                 else:
                     priority = _pick_external_repo_priority(session, tag)
             session.addExternalRepoToTag(tag, rinfo['name'], priority)
-            print "Added external repo %s to to tag %s (priority %i)" \
-                    % (rinfo['name'], options.tag, priority)
+            print "Added external repo %s to tag %s (priority %i)" \
+                    % (rinfo['name'], tag, priority)
 
 def handle_edit_external_repo(options, session, args):
     "[admin] Edit data for an external repo"
@@ -4357,6 +4771,81 @@ def _build_image(options, task_opts, session, args, img_type):
     if task_opts.wait or (task_opts.wait is None and not _running_in_bg()):
         session.logout()
         return watch_tasks(session, [task_id], quiet=options.quiet)
+    else:
+        return
+
+def handle_win_build(options, session, args):
+    """Build a Windows package from source"""
+    # Usage & option parsing
+    usage = _("usage: %prog win-build [options] target URL VM")
+    usage += _("\n(Specify the --help global option for a list of other " +
+               "help options)")
+    parser = OptionParser(usage=usage)
+    parser.add_option("--winspec", metavar="URL",
+                      help=_("SCM URL to retrieve the build descriptor from. " + \
+                             "If not specified, the winspec must be in the root directory " + \
+                             "of the source repository."))
+    parser.add_option("--patches", metavar="URL",
+                      help=_("SCM URL of a directory containing patches to apply " + \
+                             "to the sources before building"))
+    parser.add_option("--cpus", type="int",
+                      help=_("Number of cpus to allocate to the build VM " + \
+                             "(requires admin access)"))
+    parser.add_option("--mem", type="int",
+                      help=_("Amount of memory (in megabytes) to allocate to the build VM " + \
+                             "(requires admin access)"))
+    parser.add_option("--specfile", metavar="URL",
+                      help=_("SCM URL of a spec file fragment to use to generate wrapper RPMs"))
+    parser.add_option("--scratch", action="store_true",
+                      help=_("Perform a scratch build"))
+    parser.add_option("--repo-id", type="int", help=_("Use a specific repo"))
+    parser.add_option("--skip-tag", action="store_true",
+                      help=_("Do not attempt to tag package"))
+    parser.add_option("--background", action="store_true",
+                      help=_("Run the build at a lower priority"))
+    parser.add_option("--wait", action="store_true",
+                      help=_("Wait on the build, even if running in the background"))
+    parser.add_option("--nowait", action="store_false", dest="wait",
+                      help=_("Don't wait on build"))
+    parser.add_option("--quiet", action="store_true",
+                      help=_("Do not print the task information"), default=options.quiet)
+    (build_opts, args) = parser.parse_args(args)
+    if len(args) != 3:
+        parser.error(_("Exactly three arguments (a build target, a SCM URL, and a VM name) are required"))
+        assert False
+    activate_session(session)
+    target = args[0]
+    if target.lower() == "none" and build_opts.repo_id:
+        target = None
+        build_opts.skip_tag = True
+    else:
+        build_target = session.getBuildTarget(target)
+        if not build_target:
+            parser.error(_("Unknown build target: %s" % target))
+        dest_tag = session.getTag(build_target['dest_tag'])
+        if not dest_tag:
+            parser.error(_("Unknown destination tag: %s" % build_target['dest_tag_name']))
+        if dest_tag['locked'] and not build_opts.scratch:
+            parser.error(_("Destination tag %s is locked" % dest_tag['name']))
+    scmurl = args[1]
+    vm_name = args[2]
+    opts = {}
+    for key in ('winspec', 'patches', 'cpus', 'mem',
+                'specfile', 'scratch', 'repo_id', 'skip_tag'):
+        val = getattr(build_opts, key)
+        if val is not None:
+            opts[key] = val
+    priority = None
+    if build_opts.background:
+        #relative to koji.PRIO_DEFAULT
+        priority = 5
+    task_id = session.winBuild(vm_name, scmurl, target, opts, priority=priority)
+    if not build_opts.quiet:
+        print "Created task:", task_id
+        print "Task info: %s/taskinfo?taskID=%s" % (options.weburl, task_id)
+    if build_opts.wait or (build_opts.wait is None and not _running_in_bg()):
+        session.logout()
+        return watch_tasks(session, [task_id], quiet=build_opts.quiet)
     else:
         return
 
@@ -4804,9 +5293,12 @@ def anon_handle_download_build(options, session, args):
     parser = OptionParser(usage=usage)
     parser.add_option("--arch", dest="arches", metavar="ARCH", action="append", default=[],
                       help=_("Only download packages for this arch (may be used multiple times)"))
+    parser.add_option("--type", help=_("Download archives of the given type, rather than rpms"))
     parser.add_option("--latestfrom", dest="latestfrom", help=_("Download the latest build from this tag"))
     parser.add_option("--debuginfo", action="store_true", help=_("Also download -debuginfo rpms"))
     parser.add_option("--key", help=_("Download rpms signed with the given key"))
+    parser.add_option("--topurl", metavar="URL",
+                      help=_("URL under which Koji files are accessible"))
     parser.add_option("-q", "--quiet", action="store_true", help=_("Do not display progress meter"),
                       default=options.quiet)
     (suboptions, args) = parser.parse_args(args)
@@ -4844,36 +5336,61 @@ def anon_handle_download_build(options, session, args):
         print "No such build: %s" % build
         return 1
 
-    arches = suboptions.arches
-    if len(arches) == 0:
-        arches = None
-    rpms = session.listRPMs(buildID=info['id'], arches=arches)
-    if not rpms:
-        if arches:
-            print "No %s packages available for %s" % (" or ".join(arches), koji.buildLabel(info))
+    urls = []
+    if suboptions.type:
+        archives = session.listArchives(buildID=info['id'], type=suboptions.type)
+        if not archives:
+            print "No %s archives available for %s" % (suboptions.type, koji.buildLabel(info))
+            return 1
+        if suboptions.type == 'maven':
+            if not suboptions.topurl:
+                print "You must specify --topurl to download Maven archives"
+                return 1
+            maven_pi = koji.PathInfo(topdir=suboptions.topurl)
+            maven_info = session.getMavenBuild(info['id'], strict=True)
+            for archive in archives:
+                urls.append((maven_pi.mavenbuild(info, maven_info) + '/' + archive['filename'], archive['filename']))
+        elif suboptions.type == 'win':
+            for archive in archives:
+                url = '%s/%s/%s/%s/win/%s' % (options.pkgurl, info['name'], info['version'], info['release'],
+                                              koji.pathinfo.winfile(archive))
+                urls.append((url, koji.pathinfo.winfile(archive)))
         else:
-            print "No packages available for %s" % koji.buildLabel(info)
-        return 1
+            # can't happen
+            assert False
+    else:
+        arches = suboptions.arches
+        if len(arches) == 0:
+            arches = None
+        rpms = session.listRPMs(buildID=info['id'], arches=arches)
+        if not rpms:
+            if arches:
+                print "No %s packages available for %s" % (" or ".join(arches), koji.buildLabel(info))
+            else:
+                print "No packages available for %s" % koji.buildLabel(info)
+            return 1
+        for rpm in rpms:
+            if not suboptions.debuginfo and koji.is_debuginfo(rpm['name']):
+                continue
+            if suboptions.key:
+                fname = koji.pathinfo.signed(rpm, suboptions.key)
+            else:
+                fname = koji.pathinfo.rpm(rpm)
+            url = '%s/%s/%s/%s/%s' % (options.pkgurl, info['name'], info['version'], info['release'],
+                                      fname)
+            urls.append((url, os.path.basename(fname)))
 
     if suboptions.quiet:
         pg = None
     else:
         pg = progress.TextMeter()
     
-    for rpm in rpms:
-        if not suboptions.debuginfo and koji.is_debuginfo(rpm['name']):
-            continue
+    for url, relpath in urls:
+        file = grabber.urlopen(url, progress_obj=pg, text=relpath)
 
-        if suboptions.key:
-            fname = koji.pathinfo.signed(rpm, suboptions.key)
-        else:
-            fname = koji.pathinfo.rpm(rpm)
-
-        url = "%s/%s/%s/%s/%s" % (options.pkgurl, info['package_name'], info['version'], info['release'], fname)
-
-        file = grabber.urlopen(url, progress_obj = pg, text = "%s.%s" % (rpm['name'], rpm['arch']))
-
-        out = os.open(os.path.basename(fname), os.O_WRONLY|os.O_CREAT|os.O_TRUNC, 0666)
+        if '/' in relpath:
+            koji.ensuredir(os.path.dirname(relpath))
+        out = os.open(relpath, os.O_WRONLY|os.O_CREAT|os.O_TRUNC, 0666)
         try:
             while 1:
                 buf = file.read(4096)
@@ -4916,6 +5433,16 @@ def anon_handle_wait_repo(options, session, args):
         tag_info = session.getTag(tag)
         if not tag_info:
             parser.error("Invalid tag: %s" % tag)
+        targets = session.getBuildTargets(buildTagID=tag_info['id'])
+        if not targets:
+            print "%(name)s is not a build tag for any target" % tag_info
+            targets = session.getBuildTargets(destTagID=tag_info['id'])
+            if targets:
+                maybe = {}.fromkeys([t['build_tag_name'] for t in targets])
+                maybe = maybe.keys()
+                maybe.sort()
+                print "Suggested tags: %s" % ', '.join(maybe)
+            return 1
         tag_id = tag_info['id']
 
     last_repo = None
@@ -4989,7 +5516,7 @@ def handle_regen_repo(options, session, args):
 
 def anon_handle_search(options, session, args):
     "Search koji"
-    usage = _("usage: %prog sync [options] search_type pattern")
+    usage = _("usage: %prog search [options] search_type pattern")
     usage += _('\nAvailable search types: %s') % ', '.join(_search_types)
     usage += _("\n(Specify the --help global option for a list of other help options)")
     parser = optparse.OptionParser(usage=usage)
@@ -5098,7 +5625,7 @@ if __name__ == "__main__":
     options, command, args = get_options()
 
     session_opts = {}
-    for k in ('user', 'password', 'debug_xmlrpc', 'debug', 'max_retries',
+    for k in ('user', 'password', 'krbservice', 'debug_xmlrpc', 'debug', 'max_retries',
                 'retry_interval', 'offline_retry', 'offline_retry_interval',
                 'anon_retry'):
         value = getattr(options,k)

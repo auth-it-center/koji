@@ -38,6 +38,7 @@ import pwd
 import random
 import re
 import rpm
+import shutil
 import signal
 import socket
 import struct
@@ -211,6 +212,8 @@ BASEDIR = '/mnt/koji'
 # default task priority
 PRIO_DEFAULT = 20
 
+## BEGIN kojikamid dup
+
 #Exceptions
 class GenericError(Exception):
     """Base class for our custom exceptions"""
@@ -224,6 +227,7 @@ class GenericError(Exception):
                 return str(self.args[0])
             except:
                 return str(self.__dict__)
+## END kojikamid dup
 
 class LockConflictError(GenericError):
     """Raised when there is a lock conflict"""
@@ -241,9 +245,12 @@ class ActionNotAllowed(GenericError):
     """Raised when the session does not have permission to take some action"""
     faultCode = 1004
 
+## BEGIN kojikamid dup
+
 class BuildError(GenericError):
     """Raised when a build fails"""
     faultCode = 1005
+## END kojikamid dup
 
 class AuthLockError(AuthError):
     """Raised when a lock prevents authentication"""
@@ -303,6 +310,7 @@ class MultiCallInProgress(object):
     constructing a multicall.
     """
     pass
+
 
 #A function to get create an exception from a fault
 def convertFault(fault):
@@ -378,12 +386,15 @@ def decode_args2(args, names, strict=True):
     ret.update(opts)
     return ret
 
+## BEGIN kojikamid dup
+
 def encode_int(n):
     """If n is too large for a 32bit signed, convert it to a string"""
     if n <= 2147483647:
         return n
     #else
     return str(n)
+## END kojikamid dup
 
 def decode_int(n):
     """If n is not an integer, attempt to convert it"""
@@ -401,17 +412,21 @@ def safe_xmlrpc_loads(s):
     except Fault, f:
         return f
 
+## BEGIN kojikamid dup
+
 def ensuredir(directory):
     """Create directory, if necessary."""
-    if os.path.isdir(directory):
-        return
     try:
-        os.makedirs(directory)
+        if not os.path.isdir(directory):
+            os.makedirs(directory)
     except OSError:
         #thrown when dir already exists (could happen in a race)
         if not os.path.isdir(directory):
             #something else must have gone wrong
             raise
+    return directory
+
+## END kojikamid dup
 
 def daemonize():
     """Detach and run in background"""
@@ -856,7 +871,7 @@ def parse_NVRA(nvra):
 
 def is_debuginfo(name):
     """Determines if an rpm is a debuginfo rpm, based on name"""
-    if name.endswith('-debuginfo') or name.endswith('-debuginfo-common'):
+    if name.endswith('-debuginfo') or name.find('-debuginfo-') != -1:
         return True
     return False
 
@@ -876,6 +891,8 @@ def canonArch(arch):
         return 'sparc'
     elif fnmatch(arch, 'alpha*'):
         return 'alpha'
+    elif fnmatch(arch,'arm*'):
+        return 'arm'
     else:
         return arch
 
@@ -1349,13 +1366,11 @@ def openRemoteFile(relpath, topurl=None, topdir=None):
     on options"""
     if topurl:
         url = "%s/%s" % (topurl, relpath)
-        fo = urllib2.urlopen(url)
-
-        # horrible hack because urlopen() returns a wrapped HTTPConnection
-        # object which doesn't implement fileno()
-        def urlopen_fileno(fileobj):
-            return lambda: fileobj.fp._sock.fp.fileno()
-        fo.fileno = urlopen_fileno(fo)
+        src = urllib2.urlopen(url)
+        fo = tempfile.TemporaryFile()
+        shutil.copyfileobj(src, fo)
+        src.close()
+        fo.seek(0)
     elif topdir:
         fn = "%s/%s" % (topdir, relpath)
         fo = open(fn)
@@ -1393,13 +1408,33 @@ class PathInfo(object):
         release = build['release']
         return self.topdir + ("/maven2/%(group_path)s/%(artifact_id)s/%(version)s/%(release)s" % locals())
 
+    def winbuild(self, build):
+        """Return the directory where the Windows build exists"""
+        return self.build(build) + '/win'
+
+    def winfile(self, wininfo):
+        """Return the relative path from the winbuild directory where the
+           file identified by wininfo is located."""
+        filepath = wininfo['filename']
+        if wininfo['relpath']:
+            filepath = wininfo['relpath'] + '/' + filepath
+        return filepath
+
+    def mavenfile(self, maveninfo):
+        """Return the relative path the file exists in the per-tag Maven repo"""
+        group_path = maveninfo['group_id'].replace('.', '/')
+        artifact_id = maveninfo['artifact_id']
+        version = maveninfo['version']
+        filename = maveninfo['filename']
+        return "%(group_path)s/%(artifact_id)s/%(version)s/%(filename)s" % locals()
+
     def mavenrepo(self, build, maveninfo):
         """Return the directory where the Maven artifact exists in the per-tag Maven repo
         (/mnt/koji/repos/tag-name/repo-id/maven2/)"""
         group_path = maveninfo['group_id'].replace('.', '/')
         artifact_id = maveninfo['artifact_id']
         version = maveninfo['version']
-        return self.topdir + ("/maven2/%(group_path)s/%(artifact_id)s/%(version)s" % locals())
+        return self.topdir + "/maven2/" + os.path.dirname(self.mavenfile(maveninfo))
 
     def rpm(self,rpminfo):
         """Return the path (relative to build_dir) where an rpm belongs"""
@@ -1565,7 +1600,7 @@ class ClientSession(object):
             # We're trying to log ourself in.  Connect using existing credentials.
             cprinc = ccache.principal()
 
-        sprinc = krbV.Principal(name=self._serverPrincipal(), context=ctx)
+        sprinc = krbV.Principal(name=self._serverPrincipal(cprinc), context=ctx)
 
         ac = krbV.AuthContext(context=ctx)
         ac.flags = krbV.KRB5_AUTH_CONTEXT_DO_SEQUENCE|krbV.KRB5_AUTH_CONTEXT_DO_TIME
@@ -1602,22 +1637,17 @@ class ClientSession(object):
 
         return True
 
-    def _serverPrincipal(self):
+    def _serverPrincipal(self, cprinc):
         """Get the Kerberos principal of the server we're connecting
-        to, based on baseurl.  Assume the last two components of the
-        server name are the Kerberos realm."""
+        to, based on baseurl."""
         servername = urlparse.urlparse(self.baseurl)[1]
         portspec = servername.find(':')
         if portspec != -1:
             servername = servername[:portspec]
+        realm = cprinc.realm
+        service = self.opts.get('krbservice', 'host')
 
-        parts = servername.split('.')
-        if len(parts) < 2:
-            domain = servername.upper()
-        else:
-            domain = '.'.join(parts[-2:]).upper()
-
-        return 'host/%s@%s' % (servername, domain)
+        return '%s/%s@%s' % (service, servername, realm)
 
     def ssl_login(self, cert, ca, serverca, proxyuser=None):
         if not self.baseurl.startswith('https:'):
@@ -1937,13 +1967,17 @@ def formatTimeLong(value):
 
 def buildLabel(buildInfo, showEpoch=False):
     """Format buildInfo (dict) into a descriptive label."""
-    epoch = buildInfo['epoch']
+    epoch = buildInfo.get('epoch')
     if showEpoch and epoch != None:
         epochStr = '%i:' % epoch
     else:
         epochStr = ''
-    return '%s%s-%s-%s' % (epochStr, buildInfo['package_name'],
-                           buildInfo['version'], buildInfo['release'])
+    name = buildInfo.get('package_name')
+    if not name:
+        name = buildInfo.get('name')
+    return '%s%s-%s-%s' % (epochStr, name,
+                           buildInfo.get('version'),
+                           buildInfo.get('release'))
 
 def _module_info(url):
     module_info = ''
@@ -1997,6 +2031,16 @@ def taskLabel(taskInfo):
                 extra = '%s, %s' % (build_tag['name'], buildLabel(build))
             else:
                 extra = build_tag['name']
+    elif method == 'winbuild':
+        if taskInfo.has_key('request'):
+            vm = taskInfo['request'][0]
+            url = taskInfo['request'][1]
+            target = taskInfo['request'][2]
+            module_info = _module_info(url)
+            extra = '%s, %s' % (target, module_info)
+    elif method == 'vmExec':
+        if taskInfo.has_key('request'):
+            extra = taskInfo['request'][0]
     elif method == 'buildNotification':
         if taskInfo.has_key('request'):
             build = taskInfo['request'][1]
@@ -2029,10 +2073,18 @@ def taskLabel(taskInfo):
                 nvrs = taskInfo['request'][2]
                 if isinstance(nvrs, list):
                     extra += ', ' + ', '.join(nvrs)
-    elif method == 'createLiveCD':
+    elif method in ('createLiveCD', 'createAppliance'):
         if taskInfo.has_key('request'):
             arch, target, ksfile = taskInfo['request'][:3]
             extra = '%s, %s, %s' % (target, arch, os.path.basename(ksfile))
+    elif method == 'restart':
+        if taskInfo.has_key('request'):
+            host = taskInfo['request'][0]
+            extra = host['name']
+    elif method == 'restartVerify':
+        if taskInfo.has_key('request'):
+            task_id, host = taskInfo['request'][:2]
+            extra = host['name']
 
     if extra:
         return '%s (%s)' % (method, extra)
@@ -2051,7 +2103,7 @@ def fixEncoding(value, fallback='iso8859-15'):
     encoded in the 'fallback' charset.
     """
     if not value:
-        return value
+        return ''
 
     if isinstance(value, unicode):
         # value is already unicode, so just convert it

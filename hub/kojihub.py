@@ -268,12 +268,14 @@ class Task(object):
         # the actual value should be retrieved from the 'new' value of the post callback
         now = time.time()
         info = self.getInfo(request=True)
+        info['result'] = result
         self.runCallbacks('preTaskStateChange', info, 'state', state)
         self.runCallbacks('preTaskStateChange', info, 'completion_ts', now)
         update = """UPDATE task SET result = %(result)s, state = %(state)s, completion_time = NOW()
         WHERE id = %(task_id)d
         """
-        _dml(update,locals())
+        # get the result from the info dict, so callbacks have a chance to modify it
+        _dml(update, {'result': info['result'], 'state': state, 'task_id': task_id})
         self.runCallbacks('postTaskStateChange', info, 'state', state)
         self.runCallbacks('postTaskStateChange', info, 'completion_ts', now)
 
@@ -444,6 +446,9 @@ class Task(object):
             info = old_info
         elif cbtype.startswith('post'):
             info = self.getInfo(request=True)
+            if info['state'] == koji.TASK_STATES['CLOSED']:
+                # if task is closed, include the result as well
+                info['result'] = self.getResult()
             new_val = info[attr]
         else:
             raise koji.GenericError, 'unknown callback type: %s' % cbtype
@@ -466,6 +471,7 @@ def make_task(method,arglist,**opts):
         channel: the channel to place the task in
         arch: the arch for the task
         priority: the priority of the task
+        assign: a host_id to assign the task to
     """
     if opts.has_key('parent'):
         # for subtasks, we use some of the parent's options as defaults
@@ -549,15 +555,14 @@ def make_task(method,arglist,**opts):
     opts['method'] = method
     koji.plugin.run_callbacks('preTaskStateChange', attribute='state', old=None, new='FREE', info=opts)
     # stick it in the database
-    q = """
-    INSERT INTO task (state,owner,method,request,priority,
-        parent,label,channel_id,arch)
-    VALUES (%(state)s,%(owner)s,%(method)s,%(request)s,%(priority)s,
-        %(parent)s,%(label)s,%(channel_id)s,%(arch)s);
-    """
-    _dml(q,opts)
-    q = """SELECT currval('task_id_seq')"""
-    task_id = _singleValue(q, {})
+
+    idata = dslice(opts, ['state', 'owner', 'method', 'request', 'priority', 'parent', 'label', 'channel_id', 'arch'])
+    if opts.get('assign'):
+        idata['state'] = koji.TASK_STATES['ASSIGNED']
+        idata['host_id'] = opts['assign']
+    insert = InsertProcessor('task', data=idata)
+    insert.execute()
+    task_id = _singleValue("SELECT currval('task_id_seq')", strict=True)
     opts['id'] = task_id
     koji.plugin.run_callbacks('postTaskStateChange', attribute='state', old=None, new='FREE', info=opts)
     return task_id
@@ -1051,8 +1056,8 @@ def readTaggedBuilds(tag,event=None,inherit=False,latest=False,package=None,owne
     set event to query at a time in the past
     set latest=True to get only the latest build per package
 
-    If type is not None, restrict the list to builds of the given type.  Currently the only
-    supported type is 'maven'.
+    If type is not None, restrict the list to builds of the given type.  Currently the supported
+    types are 'maven' and 'win'.
     """
     # build - id pkg_id version release epoch
     # tag_listing - id build_id tag_id
@@ -1077,14 +1082,17 @@ def readTaggedBuilds(tag,event=None,inherit=False,latest=False,package=None,owne
               ('users.id', 'owner_id'), ('users.name', 'owner_name')]
     st_complete = koji.BUILD_STATES['COMPLETE']
 
-    maven_join = ''
+    type_join = ''
     if type is None:
         pass
     elif type == 'maven':
-        maven_join = 'JOIN maven_builds on maven_builds.build_id = tag_listing.build_id'
+        type_join = 'JOIN maven_builds ON maven_builds.build_id = tag_listing.build_id'
         fields.extend([('maven_builds.group_id', 'maven_group_id'),
                        ('maven_builds.artifact_id', 'maven_artifact_id'),
                        ('maven_builds.version', 'maven_version')])
+    elif type == 'win':
+        type_join = 'JOIN win_builds ON win_builds.build_id = tag_listing.build_id'
+        fields.append(('win_builds.platform', 'platform'))
     else:
         raise koji.GenericError, 'unsupported build type: %s' % type
 
@@ -1098,7 +1106,7 @@ def readTaggedBuilds(tag,event=None,inherit=False,latest=False,package=None,owne
     JOIN package ON package.id = build.pkg_id
     WHERE %s AND tag_id=%%(tagid)s
         AND build.state=%%(st_complete)i
-    """ % (', '.join([pair[0] for pair in fields]), maven_join, eventCondition(event, 'tag_listing'))
+    """ % (', '.join([pair[0] for pair in fields]), type_join, eventCondition(event, 'tag_listing'))
     if package:
         q += """AND package.name = %(package)s
         """
@@ -1138,8 +1146,8 @@ def readTaggedRPMS(tag, package=None, arch=None, event=None,inherit=False,latest
     set event to query at a time in the past
     set latest=False to get all tagged RPMS (not just from the latest builds)
 
-    If type is not None, restrict the list to rpms from builds of the given type.  Currently the only
-    supported type is 'maven'.
+    If type is not None, restrict the list to rpms from builds of the given type.  Currently the
+    supported types are 'maven' and 'win'.
     """
     taglist = [tag]
     if inherit:
@@ -1227,7 +1235,7 @@ def readTaggedArchives(tag, package=None, event=None, inherit=False, latest=True
     set latest=False to get all tagged archives (not just from the latest builds)
 
     If type is not None, restrict the listing to archives of the given type.  Currently
-    the only supported type is 'maven'.
+    the supported types are 'maven' and 'win'.
     """
     taglist = [tag]
     if inherit:
@@ -1263,6 +1271,11 @@ def readTaggedArchives(tag, package=None, event=None, inherit=False, latest=True
         fields.extend([('maven_archives.group_id', 'maven_group_id'),
                        ('maven_archives.artifact_id', 'maven_artifact_id'),
                        ('maven_archives.version', 'maven_version')])
+    elif type == 'win':
+        joins.append('win_archives ON archiveinfo.id = win_archives.archive_id')
+        fields.extend([('win_archives.relpath', 'relpath'),
+                       ('win_archives.platforms', 'platforms'),
+                       ('win_archives.flags', 'flags')])
     else:
         raise koji.GenericError, 'unsupported archive type: %s' % type
 
@@ -2081,8 +2094,8 @@ def repo_init(tag, with_src=False, with_debuginfo=False, event=None):
     fo.close()
 
     if context.opts.get('EnableMaven') and tinfo['maven_support']:
-        maven_builds = dict([(build['id'], build) for build in maven_tag_packages(tinfo, event_id)])
-    
+        maven_builds = maven_tag_packages(tinfo, event_id)
+
     #link packages
     for arch in packages.iterkeys():
         if arch in ['src','noarch']:
@@ -2132,7 +2145,7 @@ def repo_init(tag, with_src=False, with_debuginfo=False, event=None):
 
     if context.opts.get('EnableMaven') and tinfo['maven_support']:
         artifact_dirs = {}
-        for build in maven_builds.itervalues():
+        for build in maven_builds:
             build_maven_info = {'group_id': build['maven_group_id'],
                                 'artifact_id': build['maven_artifact_id'],
                                 'version': build['maven_version']}
@@ -3281,6 +3294,32 @@ def get_maven_build(buildInfo, strict=False):
     WHERE build_id = %%(build_id)i""" % ', '.join(fields)
     return _singleRow(query, locals(), fields, strict)
 
+def get_win_build(buildInfo, strict=False):
+    """
+    Retrieve Windows-specific information about a build.
+    buildInfo can be either a string (n-v-r) or an integer
+    (build ID).
+    Returns a map containing the following keys:
+
+    build_id: id of the build (integer)
+    platform: the platform the build was performed on (string)
+    """
+    fields = ('build_id', 'platform')
+
+    build_id = find_build_id(buildInfo)
+    if not build_id:
+        if strict:
+            raise koji.GenericError, 'No matching build found: %s' % buildInfo
+        else:
+            return None
+    query = QueryProcessor(tables=('win_builds',), columns=fields,
+                           clauses=('build_id = %(build_id)i',),
+                           values={'build_id': build_id})
+    result = query.executeOne()
+    if strict and not result:
+        raise koji.GenericError, 'no such Windows build: %s' % buildInfo
+    return result
+
 def list_archives(buildID=None, buildrootID=None, componentBuildrootID=None, hostID=None, type=None,
                   filename=None, size=None, md5sum=None, typeInfo=None, queryOpts=None):
     """
@@ -3313,7 +3352,7 @@ def list_archives(buildID=None, buildrootID=None, componentBuildrootID=None, hos
     those associated with additional metadata of the given type.
     Currently supported types are:
 
-    maven
+    maven, win
 
     If 'maven' is specified as a type, each returned map will contain
     these additional keys:
@@ -3321,6 +3360,13 @@ def list_archives(buildID=None, buildrootID=None, componentBuildrootID=None, hos
     group_id: Maven groupId (string)
     artifact_id: Maven artifactId (string)
     version: Maven version (string)
+
+    if 'win' is specified as a type, each returned map will contain
+    these additional keys:
+
+    relpath: the relative path where the file is located (string)
+    platforms: space-separated list of platforms the file is suitable for use on (string)
+    flags: space-separated list of flags used when building the file (fre, chk) (string)
 
     typeInfo is a dict that can be used to filter the output by type-specific info.
     For the 'maven' type, this dict may contain one or more of group_id, artifact_id, or version,
@@ -3380,6 +3426,22 @@ def list_archives(buildID=None, buildrootID=None, componentBuildrootID=None, hos
                 if typeInfo.has_key(key):
                     clauses.append('maven_archives.%s = %%(%s)s' % (key, key))
                     values[key] = typeInfo[key]
+    elif type == 'win':
+        joins.append('win_archives ON archiveinfo.id = win_archives.archive_id')
+        columns.extend(['win_archives.relpath', 'win_archives.platforms', 'win_archives.flags'])
+        aliases.extend(['relpath', 'platforms', 'flags'])
+
+        if typeInfo:
+            if 'relpath' in typeInfo:
+                clauses.append('win_archives.relpath = %(relpath)s')
+                values['relpath'] = typeInfo['relpath']
+            for key in ('platforms', 'flags'):
+                if key in typeInfo:
+                    val = typeInfo[key]
+                    if not isinstance(val, (list, tuple)):
+                        val = [val]
+                    for v in val:
+                        clauses.append(r"""%s ~ E'\\m%s\\M'""" % (key, v))
     else:
         raise koji.GenericError, 'unsupported archive type: %s' % type
 
@@ -3398,13 +3460,34 @@ def get_archive(archive_id, strict=False):
     filename: name of the archive (string)
     size: size of the archive (integer)
     md5sum: md5sum of the archive (string)
+
+    If the archive is part of a Maven build, the following keys will be included:
+      group_id
+      artifact_id
+      version
+    If the archive is part of a Windows builds, the following keys will be included:
+      relpath
+      platforms
+      flags
     """
     fields = ('id', 'type_id', 'build_id', 'buildroot_id', 'filename', 'size', 'md5sum')
     select = """SELECT %s FROM archiveinfo
     WHERE id = %%(archive_id)i""" % ', '.join(fields)
-    return _singleRow(select, locals(), fields, strict=strict)
+    archive =  _singleRow(select, locals(), fields, strict=strict)
+    if not archive:
+        # strict is taken care of by _singleRow()
+        return None
+    maven_info = get_maven_archive(archive_id)
+    if maven_info:
+        del maven_info['archive_id']
+        archive.update(maven_info)
+    win_info = get_win_archive(archive_id)
+    if win_info:
+        del win_info['archive_id']
+        archive.update(win_info)
+    return archive
 
-def get_maven_archive(archive_id):
+def get_maven_archive(archive_id, strict=False):
     """
     Retrieve Maven-specific information about an archive.
     Returns a map containing the following keys:
@@ -3417,7 +3500,22 @@ def get_maven_archive(archive_id):
     fields = ('archive_id', 'group_id', 'artifact_id', 'version')
     select = """SELECT %s FROM maven_archives
     WHERE archive_id = %%(archive_id)i""" % ', '.join(fields)
-    return _singleRow(select, locals(), fields)
+    return _singleRow(select, locals(), fields, strict=strict)
+
+def get_win_archive(archive_id, strict=False):
+    """
+    Retrieve Windows-specific information about an archive.
+    Returns a map containing the following keys:
+
+    archive_id: id of the build (integer)
+    relpath: the relative path where the file is located (string)
+    platforms: space-separated list of platforms the file is suitable for use on (string)
+    flags: space-separated list of flags used when building the file (fre, chk) (string)
+    """
+    fields = ('archive_id', 'relpath', 'platforms', 'flags')
+    select = """SELECT %s FROM win_archives
+    WHERE archive_id = %%(archive_id)i""" % ', '.join(fields)
+    return _singleRow(select, locals(), fields, strict=strict)
 
 def _get_zipfile_list(archive_id, zippath):
     """
@@ -3484,12 +3582,18 @@ def list_archive_files(archive_id, queryOpts=None):
     archive_type = get_archive_type(type_id=archive_info['type_id'], strict=True)
     build_info = get_build(archive_info['build_id'], strict=True)
     maven_info = get_maven_build(build_info['id'])
-    if not maven_info:
-        # XXX support other archive types, when they exist
-        return _applyQueryOpts([], queryOpts)
+    win_info = get_win_build(build_info['id'])
 
-    file_path = os.path.join(koji.pathinfo.mavenbuild(build_info, maven_info),
-                             archive_info['filename'])
+    if maven_info:
+        file_path = os.path.join(koji.pathinfo.mavenbuild(build_info, maven_info),
+                                 archive_info['filename'])
+    elif win_info:
+        win_archive = get_win_archive(archive_info['id'], strict=True)
+        archive_info.update(win_archive)
+        file_path = os.path.join(koji.pathinfo.winbuild(build_info),
+                                 koji.pathinfo.winfile(archive_info))
+    else:
+        return _applyQueryOpts([], queryOpts)
 
     if archive_type['name'] in ('zip', 'jar'):
         return _applyQueryOpts(_get_zipfile_list(archive_id, file_path), queryOpts)
@@ -4002,7 +4106,8 @@ def import_rpm(fn,buildinfo=None,brootid=None,wrapper=False):
     rpminfo['payloadhash'] = koji.hex_string(hdr[rpm.RPMTAG_SIGMD5])
     rpminfo['brootid'] = brootid
 
-    koji.plugin.run_callbacks('preImport', type='rpm', rpm=rpminfo, build=buildinfo)
+    koji.plugin.run_callbacks('preImport', type='rpm', rpm=rpminfo, build=buildinfo,
+                              filepath=fn)
 
     q = """INSERT INTO rpminfo (id,name,version,release,epoch,
             build_id,arch,buildtime,buildroot_id,
@@ -4015,7 +4120,8 @@ def import_rpm(fn,buildinfo=None,brootid=None,wrapper=False):
     """
     _dml(q, rpminfo)
 
-    koji.plugin.run_callbacks('postImport', type='rpm', rpm=rpminfo, build=buildinfo)
+    koji.plugin.run_callbacks('postImport', type='rpm', rpm=rpminfo, build=buildinfo,
+                              filepath=fn)
 
     return rpminfo
 
@@ -4248,19 +4354,10 @@ def get_archive_type(filename=None, type_name=None, type_id=None, strict=False):
 def new_maven_build(build, maven_info):
     """
     Add Maven metadata to an existing build.
-    maven_info must contain the 'group_id' and
-    'artifact_id' keys.
-
-    Note: the "group_id-artifact_id" must match the name of the build
+    maven_info must contain the 'group_id',
+    'artifact_id', and 'version' keys.
     """
     maven_info = maven_info.copy()
-    maven_nvr = koji.maven_info_to_nvr(maven_info)
-    maven_nvr['release'] = build['release']
-
-    for field in ('name', 'version', 'epoch'):
-        if build[field] != maven_nvr[field]:
-            raise koji.BuildError, '%s mismatch (build: %s, maven: %s)' % \
-                (field, build[field], maven_nvr[field])
 
     current_maven_info = get_maven_build(build)
     if current_maven_info:
@@ -4275,6 +4372,25 @@ def new_maven_build(build, maven_info):
                     VALUES (%(build_id)i, %(group_id)s, %(artifact_id)s, %(version)s)"""
         _dml(insert, maven_info)
 
+def new_win_build(build_info, win_info):
+    """
+    Add Windows metadata to an existing build.
+    win_info must contain a 'platform' key.
+    """
+    build_id = build_info['id']
+    current = get_win_build(build_id, strict=False)
+    if current:
+        if current['platform'] != win_info['platform']:
+            update = UpdateProcessor('win_builds', clauses=['build_id=%(build_id)i'],
+                                     values={'build_id': build_id})
+            update.set(platform=win_info['platform'])
+            update.execute()
+    else:
+        insert = InsertProcessor('win_builds')
+        insert.set(build_id=build_id)
+        insert.set(platform=win_info['platform'])
+        insert.execute()
+
 def import_archive(filepath, buildinfo, type, typeInfo, buildroot_id=None):
     """
     Import an archive file and associate it with a build.  The archive can
@@ -4282,18 +4398,20 @@ def import_archive(filepath, buildinfo, type, typeInfo, buildroot_id=None):
 
     filepath: full path to the archive file
     buildinfo: dict of information about the build to associate the archive with (as returned by getBuild())
-    type: type of the archive being imported.  Currently supported archive types: maven
+    type: type of the archive being imported.  Currently supported archive types: maven, win
     typeInfo: dict of type-specific information
     buildroot_id: the id of the buildroot the archive was built in (may be null)
     """
     if not os.path.exists(filepath):
         raise koji.GenericError, 'no such file: %s' % filepath
 
+    archiveinfo = {'buildroot_id': buildroot_id}
     filename = koji.fixEncoding(os.path.basename(filepath))
+    archiveinfo['filename'] = filename
     archivetype = get_archive_type(filename, strict=True)
-    type_id = archivetype['id']
-    build_id = buildinfo['id']
-    size = os.path.getsize(filepath)
+    archiveinfo['type_id'] = archivetype['id']
+    archiveinfo['build_id'] = buildinfo['id']
+    archiveinfo['size'] = os.path.getsize(filepath)
     archivefp = file(filepath)
     m = md5_constructor()
     while True:
@@ -4302,19 +4420,19 @@ def import_archive(filepath, buildinfo, type, typeInfo, buildroot_id=None):
             break
         m.update(contents)
     archivefp.close()
-    md5sum = m.hexdigest()
+    archiveinfo['md5sum'] = m.hexdigest()
+
+    koji.plugin.run_callbacks('preImport', type='archive', archive=archiveinfo, build=buildinfo,
+                              build_type=type, filepath=filepath)
 
     # XXX verify that the buildroot is associated with a task that's associated with the build
     archive_id = _singleValue("SELECT nextval('archiveinfo_id_seq')", strict=True)
-    insert = """INSERT INTO archiveinfo
-    (id, type_id, build_id, buildroot_id, filename, size, md5sum)
-    VALUES
-    (%(archive_id)i, %(type_id)i, %(build_id)i, %(buildroot_id)s, %(filename)s, %(size)i, %(md5sum)s)"""
-    _dml(insert, locals())
+    archiveinfo['id'] = archive_id
+    insert = InsertProcessor('archiveinfo', data=archiveinfo)
+    insert.execute()
 
     if type == 'maven':
         maveninfo = get_maven_build(buildinfo, strict=True)
-        mavendir = koji.pathinfo.mavenbuild(buildinfo, maveninfo)
 
         if archivetype['name'] == 'pom':
             pom_info = koji.parse_pom(filepath)
@@ -4324,20 +4442,38 @@ def import_archive(filepath, buildinfo, type, typeInfo, buildroot_id=None):
                 raise koji.BuildError, 'Maven info from .pom file (%s) does not match user-supplied typeInfo (%s)' % \
                     (koji.mavenLabel(pom_maveninfo), koji.mavenLabel(typeInfo))
 
-        _insert_maven_archive(archive_id, typeInfo)
+        insert = InsertProcessor('maven_archives', data=dslice(typeInfo, ('group_id', 'artifact_id', 'version')))
+        insert.set(archive_id=archive_id)
+        insert.execute()
+
         # move the file to it's final destination
+        mavendir = koji.pathinfo.mavenbuild(buildinfo, maveninfo)
         _import_archive_file(filepath, mavendir)
         _generate_maven_metadata(maveninfo, mavendir)
+    elif type == 'win':
+        wininfo = get_win_build(buildinfo, strict=True)
+
+        insert = InsertProcessor('win_archives')
+        insert.set(archive_id=archive_id)
+        relpath = typeInfo['relpath'].strip('/')
+        insert.set(relpath=relpath)
+        if not typeInfo['platforms']:
+            raise koji.BuildError, 'no value for platforms'
+        insert.set(platforms=' '.join(typeInfo['platforms']))
+        if typeInfo['flags']:
+            insert.set(flags=' '.join(typeInfo['flags']))
+        insert.execute()
+
+        destdir = koji.pathinfo.winbuild(buildinfo)
+        if relpath:
+            destdir = os.path.join(destdir, relpath)
+        _import_archive_file(filepath, destdir)
     else:
         raise koji.BuildError, 'unsupported archive type: %s' % type
 
-def _insert_maven_archive(archive_id, mavendata):
-    """Associate the Maven data with the given archive"""
-    mavendata = mavendata.copy()
-    mavendata['archive_id'] = archive_id
-    insert = """INSERT INTO maven_archives (archive_id, group_id, artifact_id, version)
-        VALUES (%(archive_id)i, %(group_id)s, %(artifact_id)s, %(version)s)"""
-    _dml(insert, mavendata)
+    archiveinfo = get_archive(archive_id, strict=True)
+    koji.plugin.run_callbacks('postImport', type='archive', archive=archiveinfo, build=buildinfo,
+                              build_type=type, filepath=filepath)
 
 def _import_archive_file(filepath, destdir):
     """
@@ -4570,6 +4706,251 @@ def write_signed_rpm(an_rpm, sigkey, force=False):
     fo.close()
     koji.ensuredir(os.path.dirname(signedpath))
     koji.splice_rpm_sighdr(sighdr, rpm_path, signedpath)
+
+
+def query_history(tables=None, **kwargs):
+    """Returns history data from various tables that support it
+
+    tables: list of versioned tables to search, no value implies all tables
+            valid entries: user_perms, user_groups, tag_inheritance, tag_config,
+                build_target_config, external_repo_config, tag_external_repos,
+                tag_listing, tag_packages, group_config, group_req_listing,
+                group_package_listing
+
+    - Time options -
+    times are specified as an integer event or a string timestamp
+    time options are valid for all record types
+    before: either created or revoked before timestamp
+    after: either created or revoked after timestamp
+    beforeEvent: either created or revoked before event id
+    afterEvent: either created or revoked after event id
+
+    - other versioning options-
+    active: select by active status
+    editor: record created or revoked by user
+
+    - table-specific search options -
+    use of these options will implicitly limit the search to applicable tables
+    package: only for given package
+    build: only for given build
+    tag: only for given tag
+    user: only affecting a given user
+    permission: only relating to a given permission
+    external_repo: only relateing to an external repo
+    build_target: only relating to a build target
+    group: only relating to a (comps) group)
+    """
+    common_fields = {
+        #fields:aliases common to all versioned tables
+        'active' : 'active',
+        'create_event' : 'create_event',
+        'revoke_event' : 'revoke_event',
+        'creator_id' : 'creator_id',
+        'revoker_id' : 'revoker_id',
+        }
+    common_joins = [
+        "events AS ev1 ON ev1.id = create_event",
+        "LEFT OUTER JOIN events AS ev2 ON ev2.id = revoke_event",
+        "users AS creator ON creator.id = creator_id",
+        "LEFT OUTER JOIN users AS revoker ON revoker.id = revoker_id",
+        ]
+    common_joined_fields = {
+        'creator.name' : 'creator_name',
+        'revoker.name' : 'revoker_name',
+        'EXTRACT(EPOCH FROM ev1.time) AS create_ts' : 'create_ts',
+        'EXTRACT(EPOCH FROM ev2.time) AS revoke_ts' : 'revoke_ts',
+        }
+    table_fields = {
+        'user_perms' : ['user_id', 'perm_id'],
+        'user_groups' : ['user_id', 'group_id'],
+        'tag_inheritance' : ['tag_id', 'parent_id', 'priority', 'maxdepth', 'intransitive', 'noconfig', 'pkg_filter'],
+        'tag_config' : ['tag_id', 'arches', 'perm_id', 'locked', 'maven_support', 'maven_include_all'],
+        'build_target_config' : ['build_target_id', 'build_tag', 'dest_tag'],
+        'external_repo_config' : ['external_repo_id', 'url'],
+        'tag_external_repos' : ['tag_id', 'external_repo_id', 'priority'],
+        'tag_listing' : ['build_id', 'tag_id'],
+        'tag_packages' : ['package_id', 'tag_id', 'owner', 'blocked', 'extra_arches'],
+        'group_config' : ['group_id', 'tag_id', 'blocked', 'exported', 'display_name', 'is_default', 'uservisible',
+                            'description', 'langonly', 'biarchonly'],
+        'group_req_listing' : ['group_id', 'tag_id', 'req_id', 'blocked', 'type', 'is_metapkg'],
+        'group_package_listing' : ['group_id', 'tag_id', 'package', 'blocked', 'type', 'basearchonly', 'requires'],
+        }
+    name_joins = {
+        #joins triggered by table fields for name lookup
+        #field : [table, join-alias, alias]
+        'user_id' : ['users', 'users', 'user'],
+        'perm_id' : ['permissions', 'permission'],
+        #group_id is overloaded (special case below)
+        'tag_id' : ['tag'],
+        'parent_id' : ['tag', 'parent'],
+        'build_target_id' : ['build_target'],
+        'build_tag' : ['tag', 'build_tag'],
+        'dest_tag' : ['tag', 'dest_tag'],
+        'external_repo_id' : ['external_repo'],
+        # build_id is special cased
+        'package_id' : ['package'],
+        'owner' : ['users', 'owner'],
+        'req_id' : ['groups', 'req'],
+        }
+    if tables is None:
+        tables = table_fields.keys()
+        tables.sort()
+    else:
+        for table in tables:
+            if table not in table_fields:
+                raise koji.GenericError, "Unknown history table: %s" % table
+    ret = {}
+    for table in tables:
+        fields = {}
+        for field in common_fields:
+            fullname = "%s.%s" % (table, field)
+            fields[fullname] = common_fields[field]
+        joins = list(common_joins)
+        fields.update(common_joined_fields)
+        joined = {}
+        for field in table_fields[table]:
+            fullname = "%s.%s" % (table,field)
+            fields[fullname] = field
+            name_join = name_joins.get(field)
+            if name_join:
+                tbl = join_as = name_join[0]
+                if len(name_join) > 1:
+                    join_as = name_join[1]
+                joined[tbl] = join_as
+                fullname = "%s.name" % join_as
+                if len(name_join) > 2:
+                    #apply alias
+                    fields[fullname] = "%s.name" % name_join[2]
+                else:
+                    fields[fullname] = fullname
+                if join_as == tbl:
+                    joins.append('LEFT OUTER JOIN %s ON %s = %s.id' % (tbl, field, tbl))
+                else:
+                    joins.append('LEFT OUTER JOIN %s AS %s ON %s = %s.id' % (tbl, join_as, field, join_as))
+            elif field == 'build_id':
+                #special case
+                fields.update({
+                    'package.name' : 'name', #XXX?
+                    'build.version' : 'version',
+                    'build.release' : 'release',
+                    'build.epoch' : 'epoch',
+                    'build.state' : 'build.state',
+                })
+                joins.extend([
+                    'build ON build_id = build.id',
+                    'package ON build.pkg_id = package.id',
+                ])
+                joined['build'] = 'build'
+                joined['package'] = 'package'
+            elif field == 'group_id':
+                if table.startswith('group_'):
+                    fields['groups.name'] = 'group.name'
+                    joins.append('groups ON group_id = groups.id')
+                    joined['groups'] = 'groups'
+                elif table == 'user_groups':
+                    fields['usergroup.name'] = 'group.name'
+                    joins.append('users AS usergroup ON group_id = usergroup.id')
+                    joined['users'] = 'usergroup'
+        clauses = []
+        skip = False
+        data = {}
+        for arg in kwargs:
+            value = kwargs[arg]
+            if arg == 'tag':
+                if 'tag' not in joined:
+                    skip = True
+                    break
+                data['tag_id'] = get_tag_id(value, strict=True)
+                if table == 'tag_inheritance':
+                    #special cased because there are two tag columns
+                    clauses.append("tag_id = %(tag_id)i OR parent_id = %(tag_id)i")
+                else:
+                    clauses.append("%s.id = %%(tag_id)i" % joined['tag'])
+            elif arg == 'build':
+                if 'build' not in joined:
+                    skip = True
+                    break
+                data['build_id'] = get_build(value, strict=True)['id']
+                clauses.append("build.id = %(build_id)i")
+            elif arg == 'package':
+                if 'package' not in joined:
+                    skip = True
+                    break
+                data['pkg_id'] = get_package_id(value, strict=True)
+                clauses.append("package.id = %(pkg_id)i")
+            elif arg == 'user':
+                if 'users' not in joined:
+                    skip = True
+                    break
+                data['affected_user_id'] = get_user(value, strict=True)['id']
+                clauses.append("%s.id = %%(affected_user_id)i" % joined['users'])
+            elif arg == 'permission':
+                if 'permissions' not in joined:
+                    skip = True
+                    break
+                data['perm_id'] = get_perm_id(value, strict=True)
+                clauses.append("%s.id = %%(perm_id)i" % joined['permissions'])
+            elif arg == 'external_repo':
+                if 'external_repo' not in joined:
+                    skip = True
+                    break
+                data['external_repo_id'] = get_external_repo_id(value, strict=True)
+                clauses.append("%s.id = %%(external_repo_id)i" % joined['external_repo'])
+            elif arg == 'build_target':
+                if 'build_target' not in joined:
+                    skip = True
+                    break
+                data['build_target_id'] = get_build_target_id(value, strict=True)
+                clauses.append("%s.id = %%(build_target_id)i" % joined['build_target'])
+            elif arg == 'group':
+                if 'groups' not in joined:
+                    skip = True
+                    break
+                data['group_id'] = get_group_id(value, strict=True)
+                clauses.append("%s.id = %%(group_id)i" % joined['groups'])
+            elif arg == 'active':
+                if value:
+                    clauses.append('active = TRUE')
+                elif value is not None:
+                    clauses.append('active = FALSE')
+            elif arg == 'editor':
+                data['editor'] = get_user(value, strict=True)['id']
+                clauses.append('creator.id = %(editor)i OR revoker.id = %(editor)i')
+                fields['creator.id = %(editor)i'] = '_created_by'
+                fields['revoker.id = %(editor)i'] = '_revoked_by'
+            elif arg == 'after':
+                if not isinstance(value, basestring):
+                    value = datetime.datetime.fromtimestamp(value).isoformat(' ')
+                data['after'] = value
+                clauses.append('ev1.time > %(after)s OR ev2.time > %(after)s')
+                fields['ev1.time > %(after)s'] = '_created_after'
+                fields['ev2.time > %(after)s'] = '_revoked_after'
+                #clauses.append('EXTRACT(EPOCH FROM ev1.time) > %(after)s OR EXTRACT(EPOCH FROM ev2.time) > %(after)s')
+            elif arg == 'afterEvent':
+                data['afterEvent'] = value
+                clauses.append('create_event > %(afterEvent)i OR revoke_event > %(afterEvent)i')
+                fields['create_event > %(afterEvent)i'] = '_created_after_event'
+                fields['revoke_event > %(afterEvent)i'] = '_revoked_after_event'
+            elif arg == 'before':
+                if not isinstance(value, basestring):
+                    value = datetime.datetime.fromtimestamp(value).isoformat(' ')
+                data['before'] = value
+                clauses.append('ev1.time < %(before)s OR ev2.time < %(before)s')
+                #clauses.append('EXTRACT(EPOCH FROM ev1.time) < %(before)s OR EXTRACT(EPOCH FROM ev2.time) < %(before)s')
+                fields['ev1.time < %(before)s'] = '_created_before'
+                fields['ev2.time < %(before)s'] = '_revoked_before'
+            elif arg == 'beforeEvent':
+                data['beforeEvent'] = value
+                clauses.append('create_event < %(beforeEvent)i OR revoke_event < %(beforeEvent)i')
+                fields['create_event < %(beforeEvent)i'] = '_created_before_event'
+                fields['revoke_event < %(beforeEvent)i'] = '_revoked_before_event'
+        if skip:
+            continue
+        fields, aliases = zip(*fields.items())
+        query = QueryProcessor(columns=fields, aliases=aliases, tables=[table],
+                               joins=joins, clauses=clauses, values=data)
+        ret[table] = query.execute()
+    return ret
 
 
 def tag_history(build=None, tag=None, package=None, queryOpts=None):
@@ -4873,6 +5254,7 @@ def reset_build(build):
         #nothing to do
         return
     minfo = get_maven_build(binfo)
+    winfo = get_win_build(binfo)
     koji.plugin.run_callbacks('preBuildStateChange', attribute='state', old=binfo['state'], new=koji.BUILD_STATES['CANCELED'], info=binfo)
     q = """SELECT id FROM rpminfo WHERE build_id=%(id)i"""
     ids = _fetchMulti(q, binfo)
@@ -4888,11 +5270,15 @@ def reset_build(build):
     for (archive_id,) in ids:
         delete = """DELETE FROM maven_archives WHERE archive_id=%(archive_id)i"""
         _dml(delete, locals())
+        delete = """DELETE FROM win_archives WHERE archive_id=%(archive_id)i"""
+        _dml(delete, locals())
         delete = """DELETE FROM buildroot_archives WHERE archive_id=%(archive_id)i"""
         _dml(delete, locals())
     delete = """DELETE FROM archiveinfo WHERE build_id=%(id)i"""
     _dml(delete, binfo)
     delete = """DELETE FROM maven_builds WHERE build_id = %(id)i"""
+    _dml(delete, binfo)
+    delete = """DELETE FROM win_builds WHERE build_id = %(id)i"""
     _dml(delete, binfo)
     binfo['state'] = koji.BUILD_STATES['CANCELED']
     update = """UPDATE build SET state=%(state)i, task_id=NULL WHERE id=%(id)i"""
@@ -4902,6 +5288,7 @@ def reset_build(build):
     builddir = koji.pathinfo.build(binfo)
     if os.path.exists(builddir):
         dirs_to_clear.append(builddir)
+    # Windows files exist under the builddir, and will be removed with the rpms
     if minfo:
         mavendir = koji.pathinfo.mavenbuild(binfo, minfo)
         if os.path.exists(mavendir):
@@ -4953,13 +5340,17 @@ def _get_build_target(task_id):
     # XXX Should we be storing a reference to the build target
     # in the build table for reproducibility?
     task = Task(task_id)
-    request = task.getRequest()
-    # request is (path-to-srpm, build-target-name, map-of-other-options)
-    if request[1]:
-        ret = get_build_targets(request[1])
-        return ret[0]
-    else:
-        return None
+    info = task.getInfo(request=True)
+    request = info['request']
+    if info['method'] in ('build', 'maven'):
+        # request is (source-url, build-target, map-of-other-options)
+        if request[1]:
+            return get_build_target(request[1])
+    elif info['method'] == 'winbuild':
+        # request is (vm-name, source-url, build-target, map-of-other-options)
+        if request[2]:
+            return get_build_target(request[2])
+    return None
 
 def get_notification_recipients(build, tag_id, state):
     """
@@ -5099,16 +5490,16 @@ def add_group_member(group, user, strict=True):
     insert.make_create()
     insert.execute()
 
-def drop_group_member(group,user):
+def drop_group_member(group, user):
     """Drop user from group"""
     context.session.assertPerm('admin')
-    group = get_user(group)
-    user = get_user(user)
-    if group['usertype'] != koji.USERTYPES['GROUP']:
-        raise koji.GenericError, "Not a group: %(name)s" % group
-    user_id = user['id']
-    group_id = group['id']
-    update = UpdateProcessor('user_groups', clauses=["user_id = %(user_id)i", "group_id = %(group_id)i"])
+    user = get_user(user, strict=True)
+    ginfo = get_user(group)
+    if not ginfo or ginfo['usertype'] != koji.USERTYPES['GROUP']:
+        raise koji.GenericError, "No such group: %s" % group
+    data = {'user_id' : user['id'], 'group_id' : ginfo['id']}
+    clauses=["user_id = %(user_id)i", "group_id = %(group_id)i"]
+    update = UpdateProcessor('user_groups', values=data, clauses=clauses)
     update.make_revoke()
     update.execute()
 
@@ -5667,6 +6058,11 @@ class UserTest(koji.policy.MatchTest):
         data[self.field] = user['name']
         return super(UserTest, self).run(data)
 
+class VMTest(koji.policy.MatchTest):
+    """Checks a VM name against glob patterns"""
+    name = 'vm_name'
+    field = 'vm_name'
+
 class IsBuildOwnerTest(koji.policy.BaseSimpleTest):
     """Check if user owns the build"""
     name = "is_build_owner"
@@ -5873,7 +6269,12 @@ def importImageInternal(task_id, filename, filesize, arch, mediatype, hash, rpml
     imageinfo['hash'] = hash
     # TODO: add xmlfile field to the imageinfo table
 
-    koji.plugin.run_callbacks('preImport', type='image', image=imageinfo)
+    filepath = os.path.join(koji.pathinfo.work(),
+                            koji.pathinfo.taskrelpath(task_id),
+                            filename)
+
+    koji.plugin.run_callbacks('preImport', type='image', image=imageinfo,
+                              filepath=filepath)
 
     q = """INSERT INTO imageinfo (id,task_id,filename,filesize,
            arch,mediatype,hash)
@@ -5898,7 +6299,8 @@ def importImageInternal(task_id, filename, filesize, arch, mediatype, hash, rpml
     for rpm_id in rpm_ids:
         _dml(q, locals())
 
-    koji.plugin.run_callbacks('postImport', type='image', image=imageinfo)
+    koji.plugin.run_callbacks('postImport', type='image', image=imageinfo,
+                              filepath=filepath)
 
     return image_id
 
@@ -5942,6 +6344,10 @@ class RootExports(object):
     def buildFromCVS(self, url, tag):
         raise koji.Deprecated
         #return make_task('buildFromCVS',[url, tag])
+
+    def restartHosts(self, priority=5):
+        context.session.assertPerm('admin')
+        return make_task('restartHosts', [], priority=priority)
 
     def build(self, src, target, opts=None, priority=None, channel=None):
         """Create a build task
@@ -6058,6 +6464,40 @@ class RootExports(object):
 
         return make_task('wrapperRPM', [url, build_tag, build, None, opts], **taskOpts)
 
+    def winBuild(self, vm, url, target, opts=None, priority=None, channel='vm'):
+        """
+        Create a Windows build task
+
+        vm: the name of the VM to run the build in
+        url: The url to checkout the source from.  May be a CVS, SVN, or GIT repository.
+        opts: task options
+        target: the build target
+        priority: the amount to increase (or decrease) the task priority, relative
+                  to the default priority; higher values mean lower priority; only
+                  admins have the right to specify a negative priority here
+        channel: the channel to allocate the task to (defaults to the "vm" channel)
+
+        Returns the task ID
+        """
+        if not context.opts.get('EnableWin'):
+            raise koji.GenericError, "Windows support not enabled"
+        targ_info = self.getBuildTarget(target)
+        policy_data = {'vm_name': vm,
+                       'tag': targ_info['dest_tag']}
+        assert_policy('vm', policy_data)
+        if not opts:
+            opts = {}
+        taskOpts = {}
+        if priority:
+            if priority < 0:
+                if not context.session.hasPerm('admin'):
+                    raise koji.ActionNotAllowed, 'only admins may create high-priority tasks'
+            taskOpts['priority'] = koji.PRIO_DEFAULT + priority
+        if channel:
+            taskOpts['channel'] = channel
+
+        return make_task('winbuild', [vm, url, target, opts], **taskOpts)
+
     # Create the image task. Called from _build_image in the client.
     #
     def buildImage (self, arch, target, ksfile, img_type, opts=None, priority=None):
@@ -6154,8 +6594,16 @@ class RootExports(object):
     def mavenEnabled(self):
         return bool(context.opts.get('EnableMaven'))
 
+    def winEnabled(self):
+        return bool(context.opts.get('EnableWin'))
+
     def showSession(self):
         return "%s" % context.session
+
+    def getSessionInfo(self):
+        if not context.session.logged_in:
+            return None
+        return context.session.session_data
 
     def showOpts(self):
         context.session.assertPerm('admin')
@@ -6325,11 +6773,12 @@ class RootExports(object):
             raise koji.GenericError, 'no file "%s" output by task %i' % (fileName, taskID)
         # Let the caller handler any IO or permission errors
         f = file(filePath, 'r')
-        if isinstance(offset, int):
-            if offset > 0:
-                f.seek(offset, 0)
-            elif offset < 0:
-                f.seek(offset, 2)
+        if isinstance(offset, str):
+            offset = int(offset)
+        if offset != None and offset > 0:
+            f.seek(offset, 0)
+        elif offset != None and offset < 0:
+            f.seek(offset, 2)
         contents = f.read(size)
         f.close()
         return base64.encodestring(contents)
@@ -6409,21 +6858,26 @@ class RootExports(object):
         filepath: path to the archive file (relative to the Koji workdir)
         buildinfo: information about the build to associate the archive with
                    May be a string (NVR), integer (buildID), or dict (containing keys: name, version, release)
-        type: type of the archive being imported.  Currently supported archive types: maven
+        type: type of the archive being imported.  Currently supported archive types: maven, win
         typeInfo: dict of type-specific information
         """
-        if not context.opts.get('EnableMaven'):
-            raise koji.GenericError, "Maven support not enabled"
         if type == 'maven':
+            if not context.opts.get('EnableMaven'):
+                raise koji.GenericError, 'Maven support not enabled'
             context.session.assertPerm('maven-import')
-            buildinfo = get_build(buildinfo, strict=True)
-            fullpath = '%s/%s' % (koji.pathinfo.work(), filepath)
-            import_archive(fullpath, buildinfo, type, typeInfo)
+        elif type == 'win':
+            if not context.opts.get('EnableWin'):
+                raise koji.GenericError, 'Windows support not enabled'
+            context.session.assertPerm('win-import')
         else:
             koji.GenericError, 'unsupported archive type: %s' % type
+        buildinfo = get_build(buildinfo, strict=True)
+        fullpath = '%s/%s' % (koji.pathinfo.work(), filepath)
+        import_archive(fullpath, buildinfo, type, typeInfo)
 
     untaggedBuilds = staticmethod(untagged_builds)
     tagHistory = staticmethod(tag_history)
+    queryHistory = staticmethod(query_history)
 
     buildMap = staticmethod(build_map)
     deleteBuild = staticmethod(delete_build)
@@ -6441,18 +6895,32 @@ class RootExports(object):
     def createMavenBuild(self, build_info, maven_info):
         """
         Associate Maven metadata with an existing build.  The build must
-        not already have associated Maven metadata.  pom_path must be a path
-        on the server (relative to the work/ directory).
+        not already have associated Maven metadata.  maven_info must be a dict
+        containing group_id, artifact_id, and version entries.
         """
-        context.session.assertPerm('admin')
+        context.session.assertPerm('maven-import')
         if not context.opts.get('EnableMaven'):
             raise koji.GenericError, "Maven support not enabled"
         build = get_build(build_info)
         if not build:
-            build_id = self.createEmptyBuild(build_info['name'], build_info['version'],
-                                             build_info['release'], build_info['epoch'])
+            build_id = new_build(dslice(build_info, ('name', 'version', 'release', 'epoch')))
             build = get_build(build_id, strict=True)
         new_maven_build(build, maven_info)
+
+    def createWinBuild(self, build_info, win_info):
+        """
+        Associate Windows metadata with an existing build.  The build must
+        not already have associated Windows metadata.  win_info must be a dict
+        containing a platform entry.
+        """
+        context.session.assertPerm('win-import')
+        if not context.opts.get('EnableWin'):
+            raise koji.GenericError, "Windows support not enabled"
+        build = get_build(build_info)
+        if not build:
+            build_id = new_build(dslice(build_info, ('name', 'version', 'release', 'epoch')))
+            build = get_build(build_id, strict=True)
+        new_win_build(build, win_info)
 
     def importRPM(self, path, basename):
         """Import an RPM into the database.
@@ -6626,7 +7094,7 @@ class RootExports(object):
         #don't check policy for admins using force
         if not (force and context.session.hasPerm('admin')):
             for build in build_list:
-                policy_data['build'] = build
+                policy_data['build'] = build['id']
                 assert_policy('tag', policy_data)
                 #XXX - we're running this check twice, here and in host.tagBuild (called by the task)
 
@@ -6699,11 +7167,13 @@ class RootExports(object):
 
     getBuild = staticmethod(get_build)
     getMavenBuild = staticmethod(get_maven_build)
+    getWinBuild = staticmethod(get_win_build)
     getArchiveTypes = staticmethod(get_archive_types)
     getArchiveType = staticmethod(get_archive_type)
     listArchives = staticmethod(list_archives)
     getArchive = staticmethod(get_archive)
     getMavenArchive = staticmethod(get_maven_archive)
+    getWinArchive = staticmethod(get_win_archive)
     listArchiveFiles = staticmethod(list_archive_files)
     getArchiveFile = staticmethod(get_archive_file)
 
@@ -6897,7 +7367,7 @@ class RootExports(object):
         completion_time is before and/or after the given time.
         The time may be specified as a floating point value indicating seconds since the Epoch (as
         returned by time.time()) or as a string in ISO format ('YYYY-MM-DD HH24:MI:SS').
-        If type is not None, only list builds of the associated type.  Currently the only supported type is 'maven'.
+        If type is not None, only list builds of the associated type.  Currently the supported types are 'maven' and 'win'.
         if typeInfo is not None, only list builds with matching type-specific info.  Must be used in conjunction with
            the type parameter.
              Currently the only supported type is 'maven', and typeInfo is a dict containing
@@ -6992,6 +7462,12 @@ class RootExports(object):
                 if typeInfo.has_key('version'):
                     clauses.append('maven_builds.version = %(version)s')
                     version = typeInfo['version']
+        elif type == 'win':
+            joins.append('win_builds ON build.id = win_builds.build_id')
+            fields.append(('win_builds.platform', 'platform'))
+            if typeInfo:
+                clauses.append('win_builds.platform = %(platform)s')
+                platform = typeInfo['platform']
         else:
             raise koji.GenericError, 'unsupported build type: %s' % type
 
@@ -7261,7 +7737,11 @@ class RootExports(object):
         else:
             raise koji.GenericError, 'either rpmID or taskID and filepath must be specified'
 
-        return koji.get_header_fields(rpm_path, headers)
+        headers = koji.get_header_fields(rpm_path, headers)
+        for key, value in headers.items():
+            if isinstance(value, basestring):
+                headers[key] = koji.fixEncoding(value)
+        return headers
 
     queryRPMSigs = staticmethod(query_rpm_sigs)
     writeSignedRPM = staticmethod(write_signed_rpm)
@@ -7557,11 +8037,11 @@ class RootExports(object):
         else:
             return ret
 
-    def getTaskChildren(self, task_id):
+    def getTaskChildren(self, task_id, request=False):
         """Return a list of the children
         of the Task with the given ID."""
         task = Task(task_id)
-        return task.getChildren()
+        return task.getChildren(request=request)
 
     def getTaskDescendents(self, task_id, request=False):
         """Get all descendents of the task with the given ID.
@@ -8087,13 +8567,14 @@ class RootExports(object):
                      'user': 'users',
                      'host': 'host',
                      'rpm': 'rpminfo',
-                     'maven': 'archiveinfo'}
+                     'maven': 'archiveinfo',
+                     'win': 'archiveinfo'}
 
     def search(self, terms, type, matchType, queryOpts=None):
         """Search for an item in the database matching "terms".
         "type" specifies what object type to search for, and must be
         one of "package", "build", "tag", "target", "user", "host",
-        or "rpm".  "matchType" specifies the type of search to
+        "rpm", "maven", or "win".  "matchType" specifies the type of search to
         perform, and must be one of "glob" or "regexp".  All searches
         are case-insensitive.  A list of maps containing "id" and
         "name" will be returned.  If no matches are found, an empty
@@ -8137,6 +8618,11 @@ class RootExports(object):
             joins.append('maven_archives ON archiveinfo.id = maven_archives.archive_id')
             clause = "archiveinfo.filename %s %%(terms)s or maven_archives.group_id || '-' || " \
                 "maven_archives.artifact_id || '-' || maven_archives.version %s %%(terms)s" % (oper, oper)
+        elif type == 'win':
+            cols = ('id', "trim(leading '/' from win_archives.relpath || '/' || archiveinfo.filename)")
+            joins.append('win_archives ON archiveinfo.id = win_archives.archive_id')
+            clause = "archiveinfo.filename %s %%(terms)s or win_archives.relpath || '/' || " \
+                     "archiveinfo.filename %s %%(terms)s" % (oper, oper)
         else:
             clause = 'name %s %%(terms)s' % oper
 
@@ -8679,6 +9165,65 @@ class HostExports(object):
                     os.rename(fn,dest)
                     os.symlink(dest,fn)
 
+    def moveMavenBuildToScratch(self, task_id, results, rpm_results):
+        "Move a completed Maven scratch build into place (not imported)"
+        if not context.opts.get('EnableMaven'):
+            raise koji.GenericError, 'Maven support not enabled'
+        host = Host()
+        host.verify()
+        task = Task(task_id)
+        task.assertHost(host.id)
+        scratchdir = koji.pathinfo.scratch()
+        username = get_user(task.getOwner())['name']
+        destdir = os.path.join(scratchdir, username, 'task_%s' % task_id)
+        for reldir, files in results['files'].items() + [('', results['logs'])]:
+            for filename in files:
+                if reldir:
+                    relpath = os.path.join(reldir, filename)
+                else:
+                    relpath = filename
+                src = os.path.join(koji.pathinfo.task(results['task_id']), relpath)
+                dest = os.path.join(destdir, relpath)
+                koji.ensuredir(os.path.dirname(dest))
+                os.rename(src, dest)
+                os.symlink(dest, src)
+        if rpm_results:
+            for relpath in [rpm_results['srpm']] + rpm_results['rpms'] + \
+                    rpm_results['logs']:
+                src = os.path.join(koji.pathinfo.task(rpm_results['task_id']),
+                                   relpath)
+                dest = os.path.join(destdir, 'rpms', relpath)
+                koji.ensuredir(os.path.dirname(dest))
+                os.rename(src, dest)
+                os.symlink(dest, src)
+
+    def moveWinBuildToScratch(self, task_id, results, rpm_results):
+        "Move a completed Windows scratch build into place (not imported)"
+        if not context.opts.get('EnableWin'):
+            raise koji.GenericError, 'Windows support not enabled'
+        host = Host()
+        host.verify()
+        task = Task(task_id)
+        task.assertHost(host.id)
+        scratchdir = koji.pathinfo.scratch()
+        username = get_user(task.getOwner())['name']
+        destdir = os.path.join(scratchdir, username, 'task_%s' % task_id)
+        for relpath in results['output'].keys() + results['logs']:
+            filename = os.path.join(koji.pathinfo.task(results['task_id']), relpath)
+            dest = os.path.join(destdir, relpath)
+            koji.ensuredir(os.path.dirname(dest))
+            os.rename(filename, dest)
+            os.symlink(dest, filename)
+        if rpm_results:
+            for relpath in [rpm_results['srpm']] + rpm_results['rpms'] + \
+                    rpm_results['logs']:
+                filename = os.path.join(koji.pathinfo.task(rpm_results['task_id']),
+                                        relpath)
+                dest = os.path.join(destdir, 'rpms', relpath)
+                koji.ensuredir(os.path.dirname(dest))
+                os.rename(filename, dest)
+                os.symlink(dest, filename)
+
     def initBuild(self,data):
         """Create a stub build entry.
 
@@ -8747,10 +9292,21 @@ class HostExports(object):
         data['state'] = koji.BUILD_STATES['BUILDING']
         data['completion_time'] = None
         build_id = new_build(data)
-        build_info['id'] = build_id
-        new_maven_build(build_info, maven_info)
+        data['id'] = build_id
+        new_maven_build(data, maven_info)
 
-        return build_id, build_info
+        return data
+
+    def createMavenBuild(self, build_info, maven_info):
+        """
+        Associate Maven metadata with an existing build.  Used
+        by the rpm2maven plugin.
+        """
+        host = Host()
+        host.verify()
+        if not context.opts.get('EnableMaven'):
+            raise koji.GenericError, "Maven support not enabled"
+        new_maven_build(build_info, maven_info)
 
     def completeMavenBuild(self, task_id, build_id, maven_results, rpm_results):
         """Complete the Maven build."""
@@ -8808,6 +9364,23 @@ class HostExports(object):
         # send email
         build_notification(task_id, build_id)
 
+    def importArchive(self, filepath, buildinfo, type, typeInfo):
+        """
+        Import an archive file and associate it with a build.  The archive can
+        be any non-rpm filetype supported by Koji.  Used by the rpm2maven plugin.
+        """
+        host = Host()
+        host.verify()
+        if type == 'maven':
+            if not context.opts.get('EnableMaven'):
+                raise koji.GenericError, 'Maven support not enabled'
+        elif type == 'win':
+            if not context.opts.get('EnableWin'):
+                raise koji.GenericError, 'Windows support not enabled'
+        else:
+            koji.GenericError, 'unsupported archive type: %s' % type
+        import_archive(filepath, buildinfo, type, typeInfo)
+
     def importWrapperRPMs(self, task_id, build_id, rpm_results):
         """Import the wrapper rpms and associate them with the given build.  Any existing
            rpms are deleted before import."""
@@ -8829,6 +9402,74 @@ class HostExports(object):
             raise koji.GenericError, 'wrapper rpms for %s have already been imported' % koji.buildLabel(build_info)
 
         _import_wrapper(task.id, build_info, rpm_results)
+
+    def initWinBuild(self, task_id, build_info, win_info):
+        """
+        Create a new in-progress Windows build.
+        """
+        if not context.opts.get('EnableWin'):
+            raise koji.GenericError, 'Windows support not enabled'
+        host = Host()
+        host.verify()
+        #sanity checks
+        task = Task(task_id)
+        task.assertHost(host.id)
+        # build_info must contain name, version, and release
+        data = build_info.copy()
+        data['task_id'] = task_id
+        data['owner'] = task.getOwner()
+        data['state'] = koji.BUILD_STATES['BUILDING']
+        data['completion_time'] = None
+        build_id = new_build(data)
+        data['id'] = build_id
+        new_win_build(data, win_info)
+        return data
+
+    def completeWinBuild(self, task_id, build_id, results, rpm_results):
+        """Complete a Windows build"""
+        if not context.opts.get('EnableWin'):
+            raise koji.GenericError, 'Windows support not enabled'
+        host = Host()
+        host.verify()
+        task = Task(task_id)
+        task.assertHost(host.id)
+
+        build_info = get_build(build_id, strict=True)
+        win_info = get_win_build(build_id, strict=True)
+
+        task_dir = koji.pathinfo.task(results['task_id'])
+        # import the build output
+        for relpath, metadata in results['output'].iteritems():
+            archivetype = get_archive_type(relpath)
+            if not archivetype:
+                # Unknown archive type, skip it
+                continue
+            filepath = os.path.join(task_dir, relpath)
+            metadata['relpath'] = os.path.dirname(relpath)
+            import_archive(filepath, build_info, 'win', metadata)
+
+        # move the logs to their final destination
+        for relpath in results['logs']:
+            subdir = 'win'
+            reldir = os.path.dirname(relpath)
+            if reldir:
+                subdir = os.path.join(subdir, reldir)
+            import_build_log(os.path.join(task_dir, relpath),
+                             build_info, subdir=subdir)
+
+        if rpm_results:
+            _import_wrapper(rpm_results['task_id'], build_info, rpm_results)
+
+        # update build state
+        st_complete = koji.BUILD_STATES['COMPLETE']
+        update = UpdateProcessor('build', clauses=['id=%(build_id)i'],
+                                 values={'build_id': build_id})
+        update.set(id=build_id, state=st_complete)
+        update.rawset(completion_time='now()')
+        update.execute()
+
+        # send email
+        build_notification(task_id, build_id)
 
     def failBuild(self, task_id, build_id):
         """Mark the build as failed.  If the current state is not
@@ -8965,7 +9606,7 @@ class HostExports(object):
             br.assertTask(task_id)
         return br.updateList(rpmlist)
 
-    def updateMavenBuildRootList(self, brootid, task_id, mavenlist, ignore=None, project=False):
+    def updateMavenBuildRootList(self, brootid, task_id, mavenlist, ignore=None, project=False, ignore_unknown=False):
         if not context.opts.get('EnableMaven'):
             raise koji.GenericError, "Maven support not enabled"
         host = Host()
@@ -9032,8 +9673,9 @@ class HostExports(object):
                 elif tag_archive and fileinfo['size'] == tag_archive['size']:
                     archives.append(tag_archive)
                 else:
-                    raise koji.BuildrootError, 'Unknown file in build environment: %s, size: %s' % \
-                        ('%s/%s' % (fileinfo['path'], fileinfo['filename']), fileinfo['size'])
+                    if not ignore_unknown:
+                        raise koji.BuildrootError, 'Unknown file in build environment: %s, size: %s' % \
+                              ('%s/%s' % (fileinfo['path'], fileinfo['filename']), fileinfo['size'])
 
         return br.updateArchiveList(archives, project)
 

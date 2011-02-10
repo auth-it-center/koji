@@ -1,22 +1,20 @@
 #! /bin/sh
 #
-# kojid       Start/Stop kojid
+# kojivmd       Start/Stop kojivmd
 #
-# chkconfig: 345 99 99
-# description: kojid server
-# processname: kojid
-
-# This is an interactive program, we need the current locale
+# chkconfig: - 99 99
+# description: kojivmd server
+# processname: kojivmd
 
 # Source function library.
 . /etc/init.d/functions
 
 # Check that we're a priviledged user
-[ `id -u` = 0 ] || exit 0
+[ `id -u` = 0 ] || exit 1
 
-[ -f /etc/sysconfig/kojid ] && . /etc/sysconfig/kojid
+[ -f /etc/sysconfig/kojivmd ] && . /etc/sysconfig/kojivmd
 
-prog="kojid"
+prog="kojivmd"
 
 # Check that networking is up.
 if [ "$NETWORKING" = "no" ]
@@ -24,7 +22,7 @@ then
     exit 0
 fi
 
-[ -f /usr/sbin/kojid ] || exit 0
+[ -f /usr/sbin/kojivmd ] || exit 1
 
 RETVAL=0
 
@@ -33,25 +31,21 @@ start() {
     cd /
     ARGS=""
     [ "$FORCE_LOCK" == "Y" ] && ARGS="$ARGS --force-lock"
-    [ "$KOJID_DEBUG" == "Y" ] && ARGS="$ARGS --debug"
-    [ "$KOJID_VERBOSE" == "Y" ] && ARGS="$ARGS --verbose"
-    # XXX Fix for make download-checks in kernel builds
-    # Remove once we're running the buildSRPMFromSCM task
-    # as an unpriviledged user with their own environment
-    export HOME="/root"
-    daemon /usr/sbin/kojid $ARGS
+    [ "$KOJIVMD_DEBUG" == "Y" ] && ARGS="$ARGS --debug"
+    [ "$KOJIVMD_VERBOSE" == "Y" ] && ARGS="$ARGS --verbose"
+    daemon /usr/sbin/kojivmd $ARGS
     RETVAL=$?
     echo
-    [ $RETVAL -eq 0 ] && touch /var/lock/subsys/kojid
+    [ $RETVAL -eq 0 ] && touch /var/lock/subsys/kojivmd
     return $RETVAL
 }
 
 stop() {
     echo -n $"Stopping $prog: "
-    killproc kojid
+    killproc kojivmd
     RETVAL=$?
     echo
-    [ $RETVAL -eq 0 ] && rm -f /var/lock/subsys/kojid
+    [ $RETVAL -eq 0 ] && rm -f /var/lock/subsys/kojivmd
     return $RETVAL
 }
 
@@ -62,7 +56,7 @@ restart() {
 
 graceful() {
     #SIGUSR1 initiates a graceful restart
-    pid=$(pidofproc kojid)
+    pid=$(pidofproc kojivmd)
     if test -z "$pid"
     then
         echo $"$prog not running"
@@ -86,13 +80,13 @@ case "$1" in
         restart
         ;;
   condrestart|try-restart)
-        [ -f /var/lock/subsys/kojid ] && restart || :
+        [ -f /var/lock/subsys/kojivmd ] && restart || :
         ;;
   graceful)
         graceful
         ;;
   *)
-        echo $"Usage: $0 {start|stop|status|restart|condrestart|try-restart|reload|force-reload|graceful}"
+	echo $"Usage: $0 {start|stop|status|restart|condrestart|try-restart|reload|force-reload|graceful}"
         exit 1
 esac
 
