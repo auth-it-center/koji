@@ -11,7 +11,7 @@ Name: koji
 Version: 1.6.0
 Release: %{release}%{?dist}
 License: LGPLv2 and GPLv2+
-# koji.ssl libs (from plague) are GPLv2+
+#  koji.ssl libs (from plague) are GPLv2+
 Summary: Build system tools
 Group: Applications/System
 URL: http://fedorahosted.org/koji
