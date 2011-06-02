@@ -11,7 +11,7 @@ Name: koji
 Version: 1.6.0
 Release: %{release}%{?dist}
 License: LGPLv2 and GPLv2+
-# koji.ssl libs (from plague) are GPLv2+
+#  koji.ssl libs (from plague) are GPLv2+
 Summary: Build system tools
 Group: Applications/System
 URL: http://fedorahosted.org/koji
@@ -32,7 +32,7 @@ contains shared libraries and the command-line interface.
 Summary: Koji XMLRPC interface
 Group: Applications/Internet
 License: LGPLv2 and GPLv2
-# rpmdiff lib (from rpmlint) is GPLv2 (only)
+#  rpmdiff lib (from rpmlint) is GPLv2 (only)
 Requires: httpd
 Requires: mod_python
 Requires: postgresql-python
